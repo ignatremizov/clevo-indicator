@@ -317,6 +317,12 @@ static void main_init_share(void) {
 static int main_ec_worker(void) {
     setuid(0);
     system("modprobe ec_sys");
+    FILE* io_fd = fopen("/sys/kernel/debug/ec/ec0/io", "r");
+    if (io_fd <= 0) 
+    {
+        printf("unable to read EC from sysfs: %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
     while (share_info->exit == 0) {
         // check parent
         if (parent_pid != 0 && kill(parent_pid, 0) == -1) {
@@ -331,13 +337,9 @@ static int main_ec_worker(void) {
             share_info->manual_prev_fan_duty = new_fan_duty;
         }
         // read EC
-        int io_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY, 0);
-        if (io_fd < 0) {
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
-            exit(EXIT_FAILURE);
-        }
+        rewind(io_fd);
         unsigned char buf[EC_REG_SIZE];
-        ssize_t len = read(io_fd, buf, EC_REG_SIZE);
+        ssize_t len = fread(buf, 1, EC_REG_SIZE, io_fd);
         switch (len) {
         case -1:
             printf("unable to read EC from sysfs: %s\n", strerror(errno));
@@ -356,7 +358,6 @@ static int main_ec_worker(void) {
         default:
             printf("wrong EC size from sysfs: %ld\n", len);
         }
-        close(io_fd);
         // auto EC
         if (share_info->auto_duty == 1) {
             int next_duty = ec_auto_duty_adjust();
@@ -372,6 +373,7 @@ static int main_ec_worker(void) {
         //
         usleep(200 * 1000);
     }
+    fclose(io_fd);
     printf("worker quit\n");
     return EXIT_SUCCESS;
 }
