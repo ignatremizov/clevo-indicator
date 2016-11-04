@@ -612,7 +612,7 @@ static int ec_io_wait(const uint32_t port, const uint32_t flag,
         usleep(1000);
         data = inb(port);
     }
-    if (i >= 100) {
+    if (i >= 1000) {
         printf("wait_ec error on port 0x%x, data=0x%x, flag=0x%x, value=0x%x\n",
                 port, data, flag, value);
         return EXIT_FAILURE;
