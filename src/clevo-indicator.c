@@ -154,6 +154,145 @@ struct {
 
 static pid_t parent_pid = 0;
 
+void autoset_cpu_gpu()
+{
+    struct sched_param param;
+    param.sched_priority = 99;
+    if (sched_setscheduler(0, SCHED_FIFO, & param) != 0)
+    {
+        printf("sched_setscheduler error\n");
+        exit(EXIT_FAILURE);  
+    }
+
+    int current[2] = {0, 0};
+    double lastCPU, lastGPU;
+    int repeatCheck[2] = {0, 0};
+    int lastfail = 0;
+    int missing = 0;
+
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    struct timeval timeout;
+    timeout.tv_sec = 0;
+    timeout.tv_usec = 0;
+    while (1)
+    {
+        //printf("Checking\n");
+        if (missing > 5)
+        {
+            ec_write_gpu_fan_duty(50);
+            ec_write_cpu_fan_duty(50);
+            exit(1);
+        }
+        
+        char buffer[10];
+        double gputemp;
+        int found = 0;
+        while (!feof(stdin))
+        {
+            FD_SET(STDIN_FILENO, &readfds);
+            if (!select(1, &readfds, NULL, NULL, &timeout)) break;
+            int nRead = read(STDIN_FILENO, buffer, 3);
+            //printf("Read %d\n", nRead);
+            if (nRead == 0) break;
+            found = 1;
+            gputemp = atoi(buffer);
+        };
+
+        if (found)
+        {
+            double cputemp = ec_query_cpu_temp();
+
+            int cur_cpu_setting = ec_query_cpu_fan_duty();
+            double avg[2];
+            if (cputemp > gputemp)
+            {
+                avg[0] = cputemp;
+                avg[1] = (2 * gputemp + cputemp) / 3;
+            }
+            else
+            {
+                avg[1] = gputemp;
+                avg[0] = (2 * cputemp + gputemp) / 3;
+            }
+            if (lastCPU > 30) avg[0] = (2 * avg[0] + lastCPU) / 3;
+            if (lastGPU > 30) avg[1] = (2 * avg[1] + lastGPU) / 3;
+            lastCPU = avg[0];
+            lastGPU = avg[1];
+
+            if (avg[1] <= 65) avg[1] -= 5;
+            else if (avg[1] <= 70) avg[1] -= (70 - avg[1]);
+
+            int setDuty[2];
+            for (int i = 0;i < 2;i++)
+            {
+                if (avg[i] <= 40) setDuty[i] = 0;
+                else if (avg[i] <= 45) setDuty[i] = 15;
+                else if (avg[i] <= 75) setDuty[i] = avg[i] - 30;
+                else if (avg[i] <= 90) setDuty[i] = (avg[i] - 75) * 3 + 45;
+                else setDuty[i] = 100;
+            }
+
+            int doSet[2] = {0, 0};
+            for (int i = 0;i < 2;i++)
+            {
+                if (current[i] == 0 && setDuty[i] != 0) doSet[i] = 1;
+                else if (setDuty[i] > current[i] && setDuty[i] > 50) doSet[i] = 1;
+                else if (setDuty[i] > current[i] + 1) doSet[i] = 1;
+                else if (setDuty[i] < current[i] - 5) doSet[i] = 1;
+                else if (setDuty[i] < current[i])
+                {
+                    if (repeatCheck[i] >= 4)
+                        doSet[i] = 1;
+                    else
+                        repeatCheck[i]++;
+                }
+
+                if (doSet[i]) repeatCheck[i] = 0;
+            }
+            if (cur_cpu_setting != current[0]) doSet[0] = doSet[1] = 1;
+
+            if (cputemp < 15 || gputemp < 15)
+            {
+                if (lastfail)
+                {
+                    doSet[0] = doSet[1] = 1;
+                    if (setDuty[0] < 50) setDuty[0] = 50;
+                    if (setDuty[1] < 50) setDuty[1] = 50;
+                }
+                else
+                {
+                    lastfail = 1;
+                    doSet[0] = doSet[1] = 0;
+                }
+            }
+            else
+            {
+                lastfail = 0;
+            }
+
+
+            printf("Temperatures C: %f G: %f --> %f %f --> Duty: %d %d (%d)- Set %d %d\n", cputemp, gputemp, avg[0], avg[1], setDuty[0], setDuty[1], cur_cpu_setting, doSet[0], doSet[1]);
+            
+            for (int i = 0;i < 2;i++)
+            {
+                if (doSet[i])
+                {
+                    current[i] = setDuty[i];
+                    if (i) ec_write_gpu_fan_duty(setDuty[1]);
+                    else ec_write_cpu_fan_duty(setDuty[0]);
+                }
+            }
+            missing = 0;
+        }
+        else
+        {
+            missing++;
+        }
+        usleep(2000000);
+    };
+}
+
 int main(int argc, char* argv[]) {
     printf("Simple fan control utility for Clevo laptops\n");
     if (check_proc_instances(NAME) > 1) {
@@ -294,6 +433,9 @@ DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n\
             if ((i + 1) % 16 == 0) printf("\n");
         }
         close(io_fd);
+    }
+    else if (strcmp(argv[1], "auto") == 0) {
+        autoset_cpu_gpu();
     }
     
     return EXIT_SUCCESS;
@@ -575,7 +717,7 @@ static int ec_query_cpu_fan_rpms(void) {
 
 static int ec_query_gpu_fan_duty(void) {
     int raw_duty = ec_io_read(EC_REG_GPU_FAN_DUTY);
-    return calculate_fan_duty(raw_duty);
+     return calculate_fan_duty(raw_duty);
 }
 
 static int ec_query_gpu_fan_rpms(void) {
@@ -589,7 +731,7 @@ static int ec_write_cpu_fan_duty(int duty_percentage) {
         printf("Wrong fan duty to write: %d\n", duty_percentage);
         return EXIT_FAILURE;
     }
-    double v_d = ((double) duty_percentage) / 100.0 * 255.0;
+    double v_d = ((double) duty_percentage) / 100.0 * 255.0 + 0.5;
     int v_i = (int) v_d;
     return ec_io_do(0x99, 0x01, v_i);
 }
@@ -599,7 +741,7 @@ static int ec_write_gpu_fan_duty(int duty_percentage) {
         printf("Wrong fan duty to write: %d\n", duty_percentage);
         return EXIT_FAILURE;
     }
-    double v_d = ((double) duty_percentage) / 100.0 * 255.0;
+    double v_d = ((double) duty_percentage) / 100.0 * 255.0 + 0.5;
     int v_i = (int) v_d;
     return ec_io_do(0x99, 0x02, v_i);
 }
@@ -649,7 +791,7 @@ static int ec_io_do(const uint32_t cmd, const uint32_t port,
 }
 
 static int calculate_fan_duty(int raw_duty) {
-    return (int) ((double) raw_duty / 255.0 * 100.0);
+    return (int) ((double) raw_duty / 255.0 * 100.0 + 0.5);
 }
 
 static int calculate_fan_rpms(int raw_rpm_high, int raw_rpm_low) {
