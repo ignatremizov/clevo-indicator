@@ -217,8 +217,8 @@ void autoset_cpu_gpu()
             }
             if (lastCPU > 30) avg[0] = (2 * avg[0] + lastCPU) / 3;
             if (lastGPU > 30) avg[1] = (2 * avg[1] + lastGPU) / 3;
-            lastCPU = avg[0];
-            lastGPU = avg[1];
+            if (cputemp >= 15) lastCPU = avg[0];
+            if (gputemp >= 15) lastGPU = avg[1];
 
             if (avg[1] <= 65) avg[1] -= 10;
             else if (avg[1] <= 75) avg[1] -= (75 - avg[1]);
