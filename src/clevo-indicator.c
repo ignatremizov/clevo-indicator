@@ -220,8 +220,8 @@ void autoset_cpu_gpu()
             lastCPU = avg[0];
             lastGPU = avg[1];
 
-            if (avg[1] <= 65) avg[1] -= 5;
-            else if (avg[1] <= 70) avg[1] -= (70 - avg[1]);
+            if (avg[1] <= 65) avg[1] -= 10;
+            else if (avg[1] <= 75) avg[1] -= (75 - avg[1]);
 
             int setDuty[2];
             for (int i = 0;i < 2;i++)
@@ -250,11 +250,10 @@ void autoset_cpu_gpu()
 
                 if (doSet[i]) repeatCheck[i] = 0;
             }
-            if (cur_cpu_setting != current[0]) doSet[0] = doSet[1] = 1;
 
-            if (cputemp < 15 || gputemp < 15)
+            if (cputemp < 15 || gputemp < 15 || cur_cpu_setting != current[0])
             {
-                if (lastfail)
+                if (lastfail >= 1)
                 {
                     doSet[0] = doSet[1] = 1;
                     if (setDuty[0] < 50) setDuty[0] = 50;
@@ -262,7 +261,7 @@ void autoset_cpu_gpu()
                 }
                 else
                 {
-                    lastfail = 1;
+                    lastfail++;
                     doSet[0] = doSet[1] = 0;
                 }
             }
@@ -270,7 +269,6 @@ void autoset_cpu_gpu()
             {
                 lastfail = 0;
             }
-
 
             printf("Temperatures C: %f G: %f --> %f %f --> Duty: %d %d (%d)- Set %d %d\n", cputemp, gputemp, avg[0], avg[1], setDuty[0], setDuty[1], cur_cpu_setting, doSet[0], doSet[1]);
             
