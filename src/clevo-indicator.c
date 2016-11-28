@@ -204,24 +204,28 @@ void autoset_cpu_gpu()
             double cputemp = ec_query_cpu_temp();
 
             int cur_cpu_setting = ec_query_cpu_fan_duty();
+
+            double gputemptmp;
+            if (gputemp <= 65) gputemptmp = gputemp - 10;
+            else if (gputemp < 75) gputemptmp = gputemp - (75 - gputemp);
+            else gputemptmp = gputemp;
+
             double avg[2];
-            if (cputemp > gputemp)
+            if (cputemp > gputemptmp)
             {
                 avg[0] = cputemp;
-                avg[1] = (2 * gputemp + cputemp) / 3;
+                avg[1] = (2 * gputemptmp + cputemp) / 3;
             }
             else
             {
-                avg[1] = gputemp;
-                avg[0] = (2 * cputemp + gputemp) / 3;
+                avg[1] = gputemptmp;
+                avg[0] = (2 * cputemp + gputemptmp) / 3;
             }
             if (lastCPU > 30) avg[0] = (2 * avg[0] + lastCPU) / 3;
             if (lastGPU > 30) avg[1] = (2 * avg[1] + lastGPU) / 3;
             if (cputemp >= 15) lastCPU = avg[0];
             if (gputemp >= 15) lastGPU = avg[1];
 
-            if (avg[1] <= 65) avg[1] -= 10;
-            else if (avg[1] <= 75) avg[1] -= (75 - avg[1]);
 
             int setDuty[2];
             for (int i = 0;i < 2;i++)
