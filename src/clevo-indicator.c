@@ -166,6 +166,7 @@ void autoset_cpu_gpu()
         exit(EXIT_FAILURE);  
     }
 
+    int initial = 1;
     int current[2] = {0, 0};
     double lastCPU, lastGPU;
     int repeatCheck[2] = {0, 0};
@@ -257,16 +258,24 @@ void autoset_cpu_gpu()
                 if (doSet[i]) repeatCheck[i] = 0;
             }
 
-            if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD || cur_cpu_setting != current[0])
+            if (initial)
+            {
+                doSet[0] = doSet[1] = 1;
+                initial = 0;
+            }
+            else if (cur_cpu_setting != current[0])
+            {
+                doSet[0] = doSet[1] = 1;
+                for (int i = 0;i < 2;i++) if (setDuty[i] < current[i]) setDuty[i] = current[i];
+            }
+            
+            if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD)
             {
                 if (lastfail >= 1)
                 {
                     doSet[0] = doSet[1] = 1;
-                    if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD)
-                    {
-                        if (setDuty[0] < 50) setDuty[0] = 50;
-                        if (setDuty[1] < 50) setDuty[1] = 50;
-                    }
+                    if (setDuty[0] < 50) setDuty[0] = 50;
+                    if (setDuty[1] < 50) setDuty[1] = 50;
                 }
                 else
                 {
@@ -286,8 +295,15 @@ void autoset_cpu_gpu()
                 if (doSet[i])
                 {
                     current[i] = setDuty[i];
-                    if (i) ec_write_gpu_fan_duty(setDuty[1]);
-                    else ec_write_cpu_fan_duty(setDuty[0]);
+                    int retVal;
+                    for (int j = 0;j < 3;j++)
+                    {
+                        if (i) retVal = ec_write_gpu_fan_duty(setDuty[1]);
+                        else retVal = ec_write_cpu_fan_duty(setDuty[0]);
+                        if (retVal == EXIT_SUCCESS) break;
+                        printf("Error setting speed, retrying...\n");
+                        usleep(50000);
+                    }
                 }
             }
             missing = 0;
