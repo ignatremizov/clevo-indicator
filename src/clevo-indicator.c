@@ -79,6 +79,8 @@
 
 #define MAX_FAN_RPM 4400.0
 
+#define TEMP_FAIL_THRESHOLD 15
+
 typedef enum {
     NA = 0, AUTO = 1, MANUAL = 2
 } MenuItemType;
@@ -223,8 +225,8 @@ void autoset_cpu_gpu()
             }
             if (lastCPU > 30) avg[0] = (2 * avg[0] + lastCPU) / 3;
             if (lastGPU > 30) avg[1] = (2 * avg[1] + lastGPU) / 3;
-            if (cputemp >= 15) lastCPU = avg[0];
-            if (gputemp >= 15) lastGPU = avg[1];
+            if (cputemp >= TEMP_FAIL_THRESHOLD) lastCPU = avg[0];
+            if (gputemp >= TEMP_FAIL_THRESHOLD) lastGPU = avg[1];
 
 
             int setDuty[2];
@@ -255,13 +257,16 @@ void autoset_cpu_gpu()
                 if (doSet[i]) repeatCheck[i] = 0;
             }
 
-            if (cputemp < 15 || gputemp < 15 || cur_cpu_setting != current[0])
+            if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD || cur_cpu_setting != current[0])
             {
                 if (lastfail >= 1)
                 {
                     doSet[0] = doSet[1] = 1;
-                    if (setDuty[0] < 50) setDuty[0] = 50;
-                    if (setDuty[1] < 50) setDuty[1] = 50;
+                    if (cputemp < TEMP_FAIL_THRESHOLD || gputemp < TEMP_FAIL_THRESHOLD)
+                    {
+                        if (setDuty[0] < 50) setDuty[0] = 50;
+                        if (setDuty[1] < 50) setDuty[1] = 50;
+                    }
                 }
                 else
                 {
