@@ -178,6 +178,13 @@ void autoset_cpu_gpu()
     struct timeval timeout;
     timeout.tv_sec = 0;
     timeout.tv_usec = 0;
+    FILE* ctrl_file = NULL;
+    
+    static int ctrl_setting_offset_cpu = 0;
+    static int ctrl_setting_offset_gpu = 0;
+    static int ctrl_setting_min_cpu = 0;
+    static int ctrl_setting_min_gpu = 0;
+    
     while (1)
     {
         //printf("Checking\n");
@@ -204,6 +211,26 @@ void autoset_cpu_gpu()
 
         if (found)
         {
+            static int ctrl_check = 0;
+            if (ctrl_check++ >= 3)
+            {
+                ctrl_check = 0;
+                ctrl_file = fopen("/tmp/clevo_fan_ctrl", "r");
+                if (ctrl_file != NULL)
+                {
+                    while (!feof(ctrl_file))
+                    {
+                        char buffer[1024];
+                        fgets(buffer, 1023, ctrl_file);
+                        if (strncmp(buffer, "offset_cpu", 10) == 0) sscanf(buffer, "offset_cpu %d", &ctrl_setting_offset_cpu);
+                        if (strncmp(buffer, "offset_gpu", 10) == 0) sscanf(buffer, "offset_gpu %d", &ctrl_setting_offset_gpu);
+                        if (strncmp(buffer, "min_cpu", 7) == 0) sscanf(buffer, "min_cpu %d", &ctrl_setting_min_cpu);
+                        if (strncmp(buffer, "min_gpu", 7) == 0) sscanf(buffer, "min_gpu %d", &ctrl_setting_min_gpu);
+                    }
+                    printf("Control settings: Offset CPU %d, Offset GPU %d, Min CPU %d, Min GPU %d\n", ctrl_setting_offset_cpu, ctrl_setting_offset_gpu, ctrl_setting_min_cpu, ctrl_setting_min_gpu);
+                    fclose(ctrl_file);
+                }
+            }
             double cputemp = ec_query_cpu_temp();
 
             int cur_cpu_setting = ec_query_cpu_fan_duty();
@@ -229,7 +256,6 @@ void autoset_cpu_gpu()
             if (cputemp >= TEMP_FAIL_THRESHOLD) lastCPU = avg[0];
             if (gputemp >= TEMP_FAIL_THRESHOLD) lastGPU = avg[1];
 
-
             int setDuty[2];
             for (int i = 0;i < 2;i++)
             {
@@ -239,6 +265,12 @@ void autoset_cpu_gpu()
                 else if (avg[i] <= 90) setDuty[i] = (avg[i] - 75) * 3 + 45;
                 else setDuty[i] = 100;
             }
+
+            if (ctrl_setting_offset_cpu) setDuty[0] += ctrl_setting_offset_cpu;
+            if (ctrl_setting_offset_gpu) setDuty[1] += ctrl_setting_offset_gpu;
+            if (ctrl_setting_min_cpu > setDuty[0]) setDuty[0] = ctrl_setting_min_cpu;
+            if (ctrl_setting_min_gpu > setDuty[1]) setDuty[1] = ctrl_setting_min_gpu;
+            for (int i = 0;i < 2;i++) if (setDuty[i] > 100) setDuty[i] = 100;
 
             int doSet[2] = {0, 0};
             for (int i = 0;i < 2;i++)
