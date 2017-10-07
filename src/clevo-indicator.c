@@ -184,6 +184,8 @@ void autoset_cpu_gpu()
     static int ctrl_setting_offset_gpu = 0;
     static int ctrl_setting_min_cpu = 0;
     static int ctrl_setting_min_gpu = 0;
+    static int ctrl_setting_force_cpu = -1;
+    static int ctrl_setting_force_gpu = -1;
     
     while (1)
     {
@@ -226,8 +228,10 @@ void autoset_cpu_gpu()
                         if (strncmp(buffer, "offset_gpu", 10) == 0) sscanf(buffer, "offset_gpu %d", &ctrl_setting_offset_gpu);
                         if (strncmp(buffer, "min_cpu", 7) == 0) sscanf(buffer, "min_cpu %d", &ctrl_setting_min_cpu);
                         if (strncmp(buffer, "min_gpu", 7) == 0) sscanf(buffer, "min_gpu %d", &ctrl_setting_min_gpu);
+                        if (strncmp(buffer, "force_cpu", 7) == 0) sscanf(buffer, "force_cpu %d", &ctrl_setting_force_cpu);
+                        if (strncmp(buffer, "force_gpu", 7) == 0) sscanf(buffer, "force_gpu %d", &ctrl_setting_force_gpu);
                     }
-                    printf("Control settings: Offset CPU %d, Offset GPU %d, Min CPU %d, Min GPU %d\n", ctrl_setting_offset_cpu, ctrl_setting_offset_gpu, ctrl_setting_min_cpu, ctrl_setting_min_gpu);
+                    printf("Control settings: Offset CPU %d, Offset GPU %d, Min CPU %d, Min GPU %d, Force CPU %d, Force GPU %d\n", ctrl_setting_offset_cpu, ctrl_setting_offset_gpu, ctrl_setting_min_cpu, ctrl_setting_min_gpu, ctrl_setting_force_cpu, ctrl_setting_force_gpu);
                     fclose(ctrl_file);
                 }
             }
@@ -270,6 +274,8 @@ void autoset_cpu_gpu()
             if (ctrl_setting_offset_gpu) setDuty[1] += ctrl_setting_offset_gpu;
             if (ctrl_setting_min_cpu > setDuty[0]) setDuty[0] = ctrl_setting_min_cpu;
             if (ctrl_setting_min_gpu > setDuty[1]) setDuty[1] = ctrl_setting_min_gpu;
+            if (ctrl_setting_force_cpu != -1) setDuty[0] = ctrl_setting_force_cpu;
+            if (ctrl_setting_force_gpu != -1) setDuty[1] = ctrl_setting_force_gpu;
             for (int i = 0;i < 2;i++) if (setDuty[i] > 100) setDuty[i] = 100;
 
             int doSet[2] = {0, 0};
