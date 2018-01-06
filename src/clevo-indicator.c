@@ -168,7 +168,7 @@ void autoset_cpu_gpu()
 
     int initial = 1;
     int current[2] = {0, 0};
-    double lastCPU, lastGPU;
+    double lastCPU = 0., lastGPU = 0.;
     int repeatCheck[2] = {0, 0};
     int lastfail = 0;
     int missing = 0;
