@@ -11,7 +11,7 @@
  ============================================================================
 
  TEST:
- gcc clevo-indicator.c -o clevo-indicator `pkg-config --cflags --libs appindicator3-0.1` -lm
+ gcc clevo-indicator.c -o clevo-indicator `pkg-config --cflags --libs ayatana-appindicator3-0.1` -lm
  sudo chown root clevo-indicator
  sudo chmod u+s clevo-indicator
 
@@ -47,7 +47,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <libappindicator/app-indicator.h>
+#include <libayatana-appindicator/app-indicator.h>
 
 #define NAME "clevo-indicator"
 
