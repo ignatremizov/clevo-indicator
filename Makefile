@@ -20,9 +20,9 @@ all: $(TARGET)
 
 install: $(TARGET)
 	@echo Install to ${DSTDIR}/bin/
-	@sudo install -m 4750 -g adm $(TARGET) ${DSTDIR}/bin/
-	@sudo chown root ${DSTDIR}/$(TARGET)
-	@sudo chmod o+sx  ${DSTDIR}/$(TARGET)
+	@sudo install -m 4755 $(TARGET) ${DSTDIR}/bin/
+	@sudo chown root:root ${DSTDIR}/$(TARGET)
+	@sudo chmod u+s ${DSTDIR}/$(TARGET)
 
 test: $(TARGET)
 	@sudo chown root $(TARGET)
@@ -35,7 +35,7 @@ $(TARGET): $(OBJ) Makefile
 	@$(CC) $(OBJ) -o $(TARGET) $(LDFLAGS) -lm
 
 clean:
-	rm $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET)
 
 $(OBJDIR)/%.o : $(SRCDIR)/%.c Makefile
 	@echo compiling $< 
