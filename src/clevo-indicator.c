@@ -808,8 +808,8 @@ static int main_dump_fan(void)
 {
     printf("Dump fan information\n");
     printf("  CPU Temp: %d°C\n", ec_query_cpu_temp());
-    printf("  CPUFAN Duty: %d%%\n", ec_query_cpu_fan_duty());
-    printf("  CPUFAN RPMs: %d RPM\n", ec_query_cpu_fan_rpms());
+    printf("  CPU FAN Duty: %d%%\n", ec_query_cpu_fan_duty());
+    printf("  CPU FAN RPMs: %d RPM\n", ec_query_cpu_fan_rpms());
     printf("  GPU Temp: %d°C\n", ec_query_gpu_temp());
     printf("  GPU FAN Duty: %d%%\n", ec_query_gpu_fan_duty());
     printf("  GPU RPMs: %d RPM\n", ec_query_gpu_fan_rpms());
