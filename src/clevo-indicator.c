@@ -452,56 +452,56 @@ int main(int argc, char *argv[])
     if (argc <= 1 || strcmp(argv[1], "help") == 0)
     {
         printf(
-            "\n\
-食用方法: \n\
-clevo-indicator set|setg [fan-duty-percentage(int)]  设定风扇(CPU|GPU)百分比\n\
-clevo-indicator help 打印帮助\n\
-clevo-indicator dump 获取温度\n\
-clevo-indicator dumpall 获取温度(原始数据)\n\
-clevo-indicator auto 自动设定风扇速度并退出(适合定时脚本)\n\
-clevo-indicator indicator 显示调速GUI\n\
-\n\
-针对蓝天模具笔记本的风扇调速工具,支持 CPU/GPU ,默认显示速度和帮助.\n\
-\n\
-参数:\n\
-  [fan-duty-percentage]\t\t目标转速百分比,类型为int\n\
-  -?\t\t\t\tDisplay this help and exit\n\
-\n\
-Without arguments this program should attempt to display an indicator in\n\
-the Ubuntu tray area for fan information display and control. The indicator\n\
-requires this program to have setuid=root flag but run from the desktop user\n\
-, because a root user is not allowed to display a desktop indicator while a\n\
-non-root user is not allowed to control Clevo EC (Embedded Controller that's\n\
-responsible of the fan). Fix permissions of this executable if it fails to\n\
-run:\n\
-    sudo chown root clevo-indicator\n\
-    sudo chmod u+s  clevo-indicator\n\
-\n\
-Note any fan duty change should take 1-2 seconds to come into effect - you\n\
-can verify by the fan speed displayed on indicator icon and also louder fan\n\
-noise.\n\
-\n\
-In the indicator mode, this program would always attempt to load kernel\n\
-module 'ec_sys', in order to query EC information from\n\
-'/sys/kernel/debug/ec/ec0/io' instead of polling EC ports for readings,\n\
-which may be more risky if interrupted or concurrently operated during the\n\
-process.\n\
-\n\
-DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n\
-\n");
+            "\n"
+            "Usage:\n"
+            "clevo-indicator set|setg [fan-duty-percentage(int)]  Set fan (CPU|GPU) percentage\n"
+            "clevo-indicator help Display help\n"
+            "clevo-indicator dump Show temperatures\n"
+            "clevo-indicator dumpall Show raw temperature data\n"
+            "clevo-indicator auto Automatically set fan speed and exit\n"
+            "clevo-indicator indicator Show fan control GUI\n"
+            "\n"
+            "Fan control utility for Clevo laptops, with CPU/GPU support, and default status output plus usage help.\n"
+            "\n"
+            "Arguments:\n"
+            "  [fan-duty-percentage]\t\tTarget duty percentage, int\n"
+            "  -?\t\t\t\tDisplay this help and exit\n"
+            "\n"
+            "Without arguments this program should attempt to display an indicator in\n"
+            "the Ubuntu tray area for fan information display and control. The indicator\n"
+            "requires this program to have setuid=root flag but run from the desktop user\n"
+            ", because a root user is not allowed to display a desktop indicator while a\n"
+            "non-root user is not allowed to control Clevo EC (Embedded Controller that's\n"
+            "responsible of the fan). Fix permissions of this executable if it fails to\n"
+            "run:\n"
+            "    sudo chown root clevo-indicator\n"
+            "    sudo chmod u+s  clevo-indicator\n"
+            "\n"
+            "Note any fan duty change should take 1-2 seconds to come into effect - you\n"
+            "can verify by the fan speed displayed on indicator icon and also louder fan\n"
+            "noise.\n"
+            "\n"
+            "In the indicator mode, this program would always attempt to load kernel\n"
+            "module 'ec_sys', in order to query EC information from\n"
+            "'/sys/kernel/debug/ec/ec0/io' instead of polling EC ports for readings,\n"
+            "which may be more risky if interrupted or concurrently operated during the\n"
+            "process.\n"
+            "\n"
+            "DO NOT MANIPULATE OR QUERY EC I/O PORTS WHILE THIS PROGRAM IS RUNNING.\n"
+            "\n");
         return main_dump_fan();
     }
     else if (strcmp(argv[1], "indicator") == 0)
     {
-        // 有个奇怪的现象,启动GUI似乎会提升风扇速度
-        // 这里强制启动GUI时使用最小速度 40
+        // Starting the GUI can temporarily increase fan speed.
+        // Force a minimum fan duty of 40% when launching GUI.
         main_test_cpu_fan(40);
         char *display = getenv("DISPLAY");
         if (display == NULL || strlen(display) == 0)
         {
             return main_dump_fan();
         }
-        // 如果有显示,则启动GUI
+        // Start GUI when display is available.
         else
         {
             parent_pid = getpid();

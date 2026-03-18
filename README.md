@@ -1,18 +1,18 @@
-# 蓝天笔记本风扇调速
+# Clevo Laptop Fan Speed Utility
 
-蓝天笔记本调速工具,支持 CPU/GPU
+Fan speed utility for Clevo laptops, supports CPU/GPU.
 
-修改自下列项目
+Based on:
 
 - https://github.com/davidrohr/clevo-indicator
 - https://github.com/SkyLandTW/clevo-indicator
 
-做了以下修改
+Recent changes:
 
-- 已解锁 GUI 手工调速下限为 40%
-- 汉化了说明,挖掘了更多参数
+- Unlocked manual GUI fan minimum to 40%.
+- Expanded documentation and exposed additional tuning parameters.
 
-## 构建/Build
+## Build
 
 ```bash
 # For Ubuntu/Debian
@@ -34,38 +34,38 @@ cd clevo-indicator
 make install
 ```
 
-## 用法/Usage
+## Usage
 
-clevo-indicator set [fan-duty-percentage(int)] 设定 CPU 风扇百分比  
-clevo-indicator setg [fan-duty-percentage(int)] 设定 GPU 风扇百分比  
-clevo-indicator help 打印帮助  
-clevo-indicator dump 获取温度  
-clevo-indicator dumpall 获取温度(原始数据)  
-clevo-indicator auto 自动设定风扇速度并退出(适合定时脚本)  
-clevo-indicator indicator 显示调速 GUI
+clevo-indicator set [fan-duty-percentage(int)] Set CPU fan percentage  
+clevo-indicator setg [fan-duty-percentage(int)] Set GPU fan percentage  
+clevo-indicator help Show help  
+clevo-indicator dump Get temperatures  
+clevo-indicator dumpall Get raw temperature data  
+clevo-indicator auto Auto-adjust fan speed and exit (for scheduled scripts)  
+clevo-indicator indicator Show GUI fan control
 
-fan-duty-percentage 是一个 int  
-指定风扇百分比
+fan-duty-percentage is an integer value  
+Specifies target fan duty percentage.
 
-## 贡献/Contributing
+## Contributing
 
 Development workflow and commit message conventions are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
 
-## 笔记/Note
+## Note
 
-简单来说调用 EC 接口需要 root 权限  
-但是一般 Linux 桌面都是给普通用户的  
-所以你需要 setuid
+The EC interface requires root privileges, while most Linux desktop sessions run
+as normal users, so this binary needs setuid.
 
-操作方法如下
+Set it up like this:
 
 ```bash
 sudo chown root clevo-indicator
 sudo chmod u+s  clevo-indicator
 ```
 
-本程序与任何通过低级调用访问 EC 的程序冲突,可能会发生未知的行为  
-本程序也没有对 EC 访问做保护
+This program conflicts with other tools that access EC through low-level calls,
+and may cause unstable behavior.  
+There is no additional protection around EC access in this project.
 
 The executable has setuid flag on, but must be run by the current desktop user,
 because only the desktop user is allowed to display a desktop indicator in
@@ -83,10 +83,10 @@ before other actions can be performed... The program also attempts to prevent
 abortion while issuing commands by catching all termination signals except
 SIGKILL - don't kill the indicator by "kill -9" unless absolutely necessary.
 
-## 修改/Hack
+## Hacking
 
-如果想要给 GUI 菜单添加更多的选项,可以去 `clevo-indicator.c` 第 138 行左右  
-找到一个数组,然后 Just Copy
+To add more GUI menu options, edit the array around line ~138 in
+`clevo-indicator.c` and extend it as needed.
 
 ```c
 static menuitems[] = {
@@ -103,7 +103,7 @@ static menuitems[] = {
     {"Quit", G_CALLBACK(ui_command_quit), 0L, NA, NULL}};
 ```
 
-关于百分比计算规则,目前是放在 `clevo-indicator.c` 第 884 行左右,如下
+Duty/auto-control rules are implemented in `clevo-indicator.c` around line ~884, for example:
 
 ```c
 static int ec_auto_duty_adjust(void)
@@ -113,7 +113,7 @@ static int ec_auto_duty_adjust(void)
     //
     if (temp >= 80 && duty < 100)
         return 100;
-    // 篇幅关系 省略大部分
+    // Additional logic omitted for brevity in this example.
     //
     return 0;
 }
