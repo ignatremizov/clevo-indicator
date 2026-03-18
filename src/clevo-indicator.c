@@ -90,6 +90,7 @@ typedef enum
 
 int use_hwmon_interface = 0;
 int hwmon_interface_num = 0;
+static int use_gpu_temp_smi = 1;
 
 static void main_init_share(void);
 static int main_ec_worker(void);
@@ -108,6 +109,7 @@ static int ec_init(void);
 static int ec_auto_duty_adjust(void);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
+static int ec_query_gpu_temp_nvidia(void);
 static int ec_query_cpu_fan_duty(void);
 static int ec_query_cpu_fan_rpms(void);
 static int ec_query_gpu_fan_duty(void);
@@ -444,6 +446,9 @@ int main(int argc, char *argv[])
         printf("unable to control EC: %s\n", strerror(errno));
         return EXIT_FAILURE;
     }
+    if (getenv("USE_EC_GPU_TEMP") != NULL &&
+        strcmp(getenv("USE_EC_GPU_TEMP"), "1") == 0)
+        use_gpu_temp_smi = 0;
     if (argc <= 1 || strcmp(argv[1], "help") == 0)
     {
         printf(
@@ -669,6 +674,8 @@ static int main_ec_worker(void)
         printf("unable to read EC from sysfs: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
+    int gpu_smi_counter = 0;
+    int gpu_temp = -1;
     while (share_info->exit == 0)
     {
         // check parent
@@ -695,7 +702,19 @@ static int main_ec_worker(void)
             break;
         case 0x100:
             share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
-            share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+            if (use_gpu_temp_smi)
+            {
+                if ((gpu_smi_counter++ % 5) == 0)
+                    gpu_temp = ec_query_gpu_temp_nvidia();
+                if (gpu_temp > 0)
+                    share_info->gpu_temp = gpu_temp;
+                else
+                    share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+            }
+            else
+            {
+                share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+            }
             share_info->fan_duty = calculate_fan_duty(buf[EC_REG_CPU_FAN_DUTY]);
             share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_CPU_FAN_RPMS_HI],
                                                       buf[EC_REG_CPU_FAN_RPMS_LO]);
@@ -946,7 +965,36 @@ static int ec_query_cpu_temp(void)
 
 static int ec_query_gpu_temp(void)
 {
+    if (use_gpu_temp_smi)
+    {
+        int smi_temp = ec_query_gpu_temp_nvidia();
+        if (smi_temp > 0)
+            return smi_temp;
+    }
     return ec_io_read(EC_REG_GPU_TEMP);
+}
+
+static int ec_query_gpu_temp_nvidia(void)
+{
+    FILE *fp = popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits", "r");
+    if (!fp)
+        return -1;
+
+    int temp = -1;
+    char line[128];
+    while (fgets(line, sizeof(line), fp) != NULL)
+    {
+        char *endptr = NULL;
+        errno = 0;
+        long parsed = strtol(line, &endptr, 10);
+        if (endptr != line && errno == 0 && parsed > 0 && parsed <= 300)
+        {
+            if (temp < 0 || parsed > temp)
+                temp = (int)parsed;
+        }
+    }
+    pclose(fp);
+    return temp;
 }
 
 static int ec_query_cpu_fan_duty(void)
