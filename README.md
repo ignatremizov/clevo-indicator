@@ -47,6 +47,10 @@ clevo-indicator indicator 显示调速 GUI
 fan-duty-percentage 是一个 int  
 指定风扇百分比
 
+## 贡献/Contributing
+
+Development workflow and commit message conventions are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## 笔记/Note
 
 简单来说调用 EC 接口需要 root 权限  
