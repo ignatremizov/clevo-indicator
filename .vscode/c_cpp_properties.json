@@ -3,11 +3,39 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**"
+                "${workspaceFolder}/**",
+                "/usr/include/libayatana-appindicator3-0.1",
+                "/usr/include/libayatana-indicator3-0.4",
+                "/usr/include/gtk-3.0",
+                "/usr/include/pango-1.0",
+                "/usr/include/glib-2.0",
+                "/usr/lib/x86_64-linux-gnu/glib-2.0/include",
+                "/usr/include/harfbuzz",
+                "/usr/include/freetype2",
+                "/usr/include/libpng16",
+                "/usr/include/libmount",
+                "/usr/include/blkid",
+                "/usr/include/fribidi",
+                "/usr/include/cairo",
+                "/usr/include/pixman-1",
+                "/usr/include/gdk-pixbuf-2.0",
+                "/usr/include/x86_64-linux-gnu",
+                "/usr/include/webp",
+                "/usr/include/gio-unix-2.0",
+                "/usr/include/atk-1.0",
+                "/usr/include/at-spi2-atk/2.0",
+                "/usr/include/at-spi-2.0",
+                "/usr/include/dbus-1.0",
+                "/usr/lib/x86_64-linux-gnu/dbus-1.0/include",
+                "/usr/include/libayatana-ido3-0.4",
+                "/usr/include/libdbusmenu-glib-0.4"
             ],
-            "defines": [],
-            "compilerPath": "/usr/bin/clang",
-            "cStandard": "c11",
+            "defines": [
+                "GDK_DISABLE_DEPRECATION_WARNINGS",
+                "GTK_DISABLE_DEPRECATION_WARNINGS"
+            ],
+            "compilerPath": "/usr/bin/gcc",
+            "cStandard": "gnu99",
             "cppStandard": "c++14",
             "intelliSenseMode": "gcc-x64"
         }
