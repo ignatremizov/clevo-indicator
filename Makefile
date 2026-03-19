@@ -13,8 +13,8 @@ OBJ = $(patsubst %.c,$(OBJDIR)/%.o,$(SRC))
 
 TARGET = bin/clevo-indicator
 
-CFLAGS += `pkg-config --cflags ayatana-appindicator3-0.1`
-LDFLAGS += `pkg-config --libs ayatana-appindicator3-0.1`
+CFLAGS += `pkg-config --cflags gtk+-3.0 ayatana-appindicator3-0.1` -DGDK_DISABLE_DEPRECATION_WARNINGS -DGTK_DISABLE_DEPRECATION_WARNINGS
+LDFLAGS += `pkg-config --libs gtk+-3.0 ayatana-appindicator3-0.1`
 
 all: $(TARGET)
 

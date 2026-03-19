@@ -11,7 +11,7 @@
  ============================================================================
 
  TEST:
- gcc clevo-indicator.c -o clevo-indicator `pkg-config --cflags --libs ayatana-appindicator3-0.1` -lm
+ gcc clevo-indicator.c -o clevo-indicator `pkg-config --cflags --libs gtk+-3.0 ayatana-appindicator3-0.1` -lm
  sudo chown root clevo-indicator
  sudo chmod u+s clevo-indicator
 
@@ -43,10 +43,13 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/syscall.h>
+#include <sys/select.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <gtk/gtk.h>
+#include <cairo/cairo.h>
 #include <libayatana-appindicator/app-indicator.h>
 
 #define NAME "clevo-indicator"
@@ -88,6 +91,16 @@ typedef enum
     MANUAL = 2
 } MenuItemType;
 
+typedef enum
+{
+    FAN_CPU = 1,
+    FAN_GPU = 2
+} FanIndex;
+
+#define FAN_COMMAND(fan, duty) (((fan) << 8) | ((duty)&0xff))
+#define FAN_CMD_FAN(cmd) (((cmd) >> 8) & 0xff)
+#define FAN_CMD_DUTY(cmd) ((cmd)&0xff)
+
 int use_hwmon_interface = 0;
 int hwmon_interface_num = 0;
 static int use_gpu_temp_smi = 1;
@@ -102,11 +115,19 @@ static int main_test_cpu_fan(int duty_percentage);
 static int main_test_gpu_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
+static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data);
+static void ui_popup_show(void);
+static void ui_popup_hide(void);
+static gboolean ui_popup_focus_out(GtkWidget *w, GdkEventFocus *e, gpointer d);
+static gboolean ui_popup_key_press(GtkWidget *w, GdkEventKey *e, gpointer d);
+static GdkPixbuf *ui_draw_fan_icon(int size);
+static void ui_status_icon_popup(GtkStatusIcon *si, guint btn, guint activate_time, gpointer data);
+static void ui_status_icon_activate(GtkStatusIcon *si, gpointer data);
 static void ui_command_quit(gchar *command);
-static void ui_toggle_menuitems(int fan_duty);
+static void ui_toggle_menuitems(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
-static int ec_auto_duty_adjust(void);
+static int ec_auto_duty_adjust(int temp, int current_duty);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
 static int ec_query_gpu_temp_nvidia(void);
@@ -127,42 +148,51 @@ static int check_proc_instances(const char *proc_name);
 static void get_time_string(char *buffer, size_t max, const char *format);
 static void signal_term(__sighandler_t handler);
 
-static AppIndicator *indicator = NULL;
+static GtkStatusIcon  *status_icon      = NULL;
+static AppIndicator   *indicator        = NULL;  /* label text in panel bar */
+static GtkWidget      *fan_popup_window = NULL;  /* grab-free two-column popup */
+static GtkWidget      *status_label     = NULL;
+#define MAX_FAN_ROWS 16
 
-struct
+typedef struct
 {
-    char label[256];
-    GCallback callback;
-    long option;
+    const char *label;
+    int duty;
     MenuItemType type;
-    GtkWidget *widget;
+    GtkWidget *cpu_btn;  /* GtkButton in the CPU column */
+    GtkWidget *gpu_btn;  /* GtkButton in the GPU column */
+} FanControlRow;
 
-} static menuitems[] = {
-    {"Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL},
-    {"", NULL, 0L, NA, NULL},
-    {"Set FAN to  40%", G_CALLBACK(ui_command_set_fan), 40, MANUAL, NULL},
-    {"Set FAN to  50%", G_CALLBACK(ui_command_set_fan), 50, MANUAL, NULL},
-    {"Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL},
-    {"Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL},
-    {"Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL},
-    {"Set FAN to  90%", G_CALLBACK(ui_command_set_fan), 90, MANUAL, NULL},
-    {"Set FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL},
-    {"", NULL, 0L, NA, NULL},
-    {"Quit", G_CALLBACK(ui_command_quit), 0L, NA, NULL}};
+static FanControlRow control_rows[] = {
+    {"AUTO", 0, AUTO,   NULL, NULL},
+    {"40%",  40, MANUAL, NULL, NULL},
+    {"50%",  50, MANUAL, NULL, NULL},
+    {"60%",  60, MANUAL, NULL, NULL},
+    {"70%",  70, MANUAL, NULL, NULL},
+    {"80%",  80, MANUAL, NULL, NULL},
+    {"90%",  90, MANUAL, NULL, NULL},
+    {"100%", 100, MANUAL, NULL, NULL},
+};
 
-static int menuitem_count = (sizeof(menuitems) / sizeof(menuitems[0]));
+static int control_rows_count = (sizeof(control_rows) / sizeof(control_rows[0]));
 
 struct
 {
     volatile int exit;
     volatile int cpu_temp;
     volatile int gpu_temp;
-    volatile int fan_duty;
-    volatile int fan_rpms;
-    volatile int auto_duty;
-    volatile int auto_duty_val;
-    volatile int manual_next_fan_duty;
-    volatile int manual_prev_fan_duty;
+    volatile int cpu_fan_duty;
+    volatile int gpu_fan_duty;
+    volatile int cpu_fan_rpms;
+    volatile int gpu_fan_rpms;
+    volatile int auto_cpu_duty;
+    volatile int auto_gpu_duty;
+    volatile int auto_cpu_duty_val;
+    volatile int auto_gpu_duty_val;
+    volatile int manual_next_cpu_fan_duty;
+    volatile int manual_next_gpu_fan_duty;
+    volatile int manual_prev_cpu_fan_duty;
+    volatile int manual_prev_gpu_fan_duty;
 } static *share_info = NULL;
 
 static pid_t parent_pid = 0;
@@ -493,13 +523,11 @@ int main(int argc, char *argv[])
     }
     else if (strcmp(argv[1], "indicator") == 0)
     {
-        // Starting the GUI can temporarily increase fan speed.
-        // Force a minimum fan duty of 40% when launching GUI.
-        main_test_cpu_fan(40);
+        main_dump_fan();
         char *display = getenv("DISPLAY");
         if (display == NULL || strlen(display) == 0)
         {
-            return main_dump_fan();
+            return EXIT_SUCCESS;
         }
         // Start GUI when display is available.
         else
@@ -656,12 +684,18 @@ static void main_init_share(void)
     share_info->exit = 0;
     share_info->cpu_temp = 0;
     share_info->gpu_temp = 0;
-    share_info->fan_duty = 0;
-    share_info->fan_rpms = 0;
-    share_info->auto_duty = 1;
-    share_info->auto_duty_val = 0;
-    share_info->manual_next_fan_duty = 0;
-    share_info->manual_prev_fan_duty = 0;
+    share_info->cpu_fan_duty = 0;
+    share_info->gpu_fan_duty = 0;
+    share_info->cpu_fan_rpms = 0;
+    share_info->gpu_fan_rpms = 0;
+    share_info->auto_cpu_duty = 0;
+    share_info->auto_gpu_duty = 0;
+    share_info->auto_cpu_duty_val = 0;
+    share_info->auto_gpu_duty_val = 0;
+    share_info->manual_next_cpu_fan_duty = 0;
+    share_info->manual_next_gpu_fan_duty = 0;
+    share_info->manual_prev_cpu_fan_duty = 0;
+    share_info->manual_prev_gpu_fan_duty = 0;
 }
 
 static int main_ec_worker(void)
@@ -676,6 +710,7 @@ static int main_ec_worker(void)
     }
     int gpu_smi_counter = 0;
     int gpu_temp = -1;
+    int initialized = 0;
     while (share_info->exit == 0)
     {
         // check parent
@@ -685,11 +720,19 @@ static int main_ec_worker(void)
             break;
         }
         // write EC
-        int new_fan_duty = share_info->manual_next_fan_duty;
-        if (new_fan_duty != 0 && new_fan_duty != share_info->manual_prev_fan_duty)
+        int new_cpu_fan_duty = share_info->manual_next_cpu_fan_duty;
+        if (new_cpu_fan_duty != 0 &&
+            new_cpu_fan_duty != share_info->manual_prev_cpu_fan_duty)
         {
-            ec_write_cpu_fan_duty(new_fan_duty);
-            share_info->manual_prev_fan_duty = new_fan_duty;
+            ec_write_cpu_fan_duty(new_cpu_fan_duty);
+            share_info->manual_prev_cpu_fan_duty = new_cpu_fan_duty;
+        }
+        int new_gpu_fan_duty = share_info->manual_next_gpu_fan_duty;
+        if (new_gpu_fan_duty != 0 &&
+            new_gpu_fan_duty != share_info->manual_prev_gpu_fan_duty)
+        {
+            ec_write_gpu_fan_duty(new_gpu_fan_duty);
+            share_info->manual_prev_gpu_fan_duty = new_gpu_fan_duty;
         }
         // read EC
         rewind(io_fd);
@@ -715,29 +758,62 @@ static int main_ec_worker(void)
             {
                 share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
             }
-            share_info->fan_duty = calculate_fan_duty(buf[EC_REG_CPU_FAN_DUTY]);
-            share_info->fan_rpms = calculate_fan_rpms(buf[EC_REG_CPU_FAN_RPMS_HI],
-                                                      buf[EC_REG_CPU_FAN_RPMS_LO]);
+            share_info->cpu_fan_duty = calculate_fan_duty(buf[EC_REG_CPU_FAN_DUTY]);
+            share_info->gpu_fan_duty = calculate_fan_duty(buf[EC_REG_GPU_FAN_DUTY]);
+            share_info->cpu_fan_rpms = calculate_fan_rpms(
+                buf[EC_REG_CPU_FAN_RPMS_HI], buf[EC_REG_CPU_FAN_RPMS_LO]);
+            share_info->gpu_fan_rpms = calculate_fan_rpms(
+                buf[EC_REG_GPU_FAN_RPMS_HI], buf[EC_REG_GPU_FAN_RPMS_LO]);
+            if (!initialized)
+            {
+                share_info->manual_prev_cpu_fan_duty = share_info->cpu_fan_duty;
+                share_info->manual_prev_gpu_fan_duty = share_info->gpu_fan_duty;
+                share_info->manual_next_cpu_fan_duty = 0;
+                share_info->manual_next_gpu_fan_duty = 0;
+                share_info->auto_cpu_duty = 0;
+                share_info->auto_gpu_duty = 0;
+                initialized = 1;
+            }
             /*
-             printf("temp=%d, duty=%d, rpms=%d\n", share_info->cpu_temp,
-             share_info->fan_duty, share_info->fan_rpms);
+             printf("temp=%d, cpu_duty=%d, cpu_rpms=%d, gpu_duty=%d, gpu_rpms=%d\n",
+             share_info->cpu_temp, share_info->cpu_fan_duty,
+             share_info->cpu_fan_rpms, share_info->gpu_fan_duty,
+             share_info->gpu_fan_rpms);
              */
             break;
         default:
             printf("wrong EC size from sysfs: %ld\n", len);
         }
         // auto EC
-        if (share_info->auto_duty == 1)
+        int target_temp = MAX(share_info->cpu_temp, share_info->gpu_temp);
+        if (share_info->auto_cpu_duty == 1)
         {
-            int next_duty = ec_auto_duty_adjust();
-            if (next_duty != 0 && next_duty != share_info->auto_duty_val)
+            int next_duty =
+                ec_auto_duty_adjust(target_temp, share_info->cpu_fan_duty);
+            if (next_duty != 0 &&
+                next_duty != share_info->auto_cpu_duty_val)
             {
                 char s_time[256];
                 get_time_string(s_time, 256, "%m/%d %H:%M:%S");
-                printf("%s CPU=%d°C, GPU=%d°C, auto fan duty to %d%%\n", s_time,
+                printf("%s CPU=%d°C, GPU=%d°C, auto CPU fan duty to %d%%\n", s_time,
                        share_info->cpu_temp, share_info->gpu_temp, next_duty);
                 ec_write_cpu_fan_duty(next_duty);
-                share_info->auto_duty_val = next_duty;
+                share_info->auto_cpu_duty_val = next_duty;
+            }
+        }
+        if (share_info->auto_gpu_duty == 1)
+        {
+            int next_duty =
+                ec_auto_duty_adjust(target_temp, share_info->gpu_fan_duty);
+            if (next_duty != 0 &&
+                next_duty != share_info->auto_gpu_duty_val)
+            {
+                char s_time[256];
+                get_time_string(s_time, 256, "%m/%d %H:%M:%S");
+                printf("%s CPU=%d°C, GPU=%d°C, auto GPU fan duty to %d%%\n", s_time,
+                       share_info->cpu_temp, share_info->gpu_temp, next_duty);
+                ec_write_gpu_fan_duty(next_duty);
+                share_info->auto_gpu_duty_val = next_duty;
             }
         }
         //
@@ -753,39 +829,117 @@ static void main_ui_worker(int argc, char **argv)
     printf("Indicator...\n");
     int desktop_uid = getuid();
     setuid(desktop_uid);
-    //
     gtk_init(&argc, &argv);
-    //
-    GtkWidget *indicator_menu = gtk_menu_new();
-    for (int i = 0; i < menuitem_count; i++)
+
+    /* ── Fan control popup window
+       GTK_WINDOW_TOPLEVEL + POPUP_MENU hint: the WM places it undecorated
+       and above other windows but does NOT take a keyboard grab, so global
+       hotkeys (PrintScreen, etc.) keep working.  A GtkMenu would take an
+       exclusive seat grab on X11 and block all keyboard events. ── */
+    fan_popup_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(fan_popup_window), FALSE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_keep_above(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_type_hint(GTK_WINDOW(fan_popup_window),
+                             GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+    gtk_container_set_border_width(GTK_CONTAINER(fan_popup_window), 0);
+    g_signal_connect(fan_popup_window, "focus-out-event",
+                     G_CALLBACK(ui_popup_focus_out), NULL);
+    g_signal_connect(fan_popup_window, "key-press-event",
+                     G_CALLBACK(ui_popup_key_press), NULL);
+
+    GtkWidget *frame = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(frame), GTK_SHADOW_ETCHED_OUT);
+    gtk_container_add(GTK_CONTAINER(fan_popup_window), frame);
+
+    GtkWidget *outer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
+    gtk_container_set_border_width(GTK_CONTAINER(outer_box), 8);
+    gtk_container_add(GTK_CONTAINER(frame), outer_box);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 2);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 2);
+    gtk_box_pack_start(GTK_BOX(outer_box), grid, TRUE, TRUE, 0);
+
+    /* Column headers */
+    GtkWidget *cpu_hdr = gtk_label_new("CPU Fan");
+    GtkWidget *gpu_hdr = gtk_label_new("GPU Fan");
+    gtk_widget_set_hexpand(cpu_hdr, TRUE);
+    gtk_widget_set_hexpand(gpu_hdr, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), cpu_hdr, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    gtk_separator_new(GTK_ORIENTATION_VERTICAL), 1, 0,
+                    1, control_rows_count + 2);
+    gtk_grid_attach(GTK_GRID(grid), gpu_hdr, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 1, 3, 1);
+
+    /* Button rows */
+    for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
     {
-        GtkWidget *item;
-        if (strlen(menuitems[i].label) == 0)
-        {
-            item = gtk_separator_menu_item_new();
-        }
-        else
-        {
-            item = gtk_menu_item_new_with_label(menuitems[i].label);
-            g_signal_connect_swapped(item, "activate",
-                                     G_CALLBACK(menuitems[i].callback),
-                                     (void *)menuitems[i].option);
-        }
-        gtk_menu_shell_append(GTK_MENU_SHELL(indicator_menu), item);
-        menuitems[i].widget = item;
+        GtkWidget *cpu_btn = gtk_button_new_with_label(control_rows[i].label);
+        GtkWidget *gpu_btn = gtk_button_new_with_label(control_rows[i].label);
+        gtk_button_set_relief(GTK_BUTTON(cpu_btn), GTK_RELIEF_NONE);
+        gtk_button_set_relief(GTK_BUTTON(gpu_btn), GTK_RELIEF_NONE);
+        gtk_widget_set_hexpand(cpu_btn, TRUE);
+        gtk_widget_set_hexpand(gpu_btn, TRUE);
+        g_signal_connect(cpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
+                         GINT_TO_POINTER(FAN_COMMAND(FAN_CPU, control_rows[i].duty)));
+        g_signal_connect(gpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
+                         GINT_TO_POINTER(FAN_COMMAND(FAN_GPU, control_rows[i].duty)));
+        gtk_grid_attach(GTK_GRID(grid), cpu_btn, 0, i + 2, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), gpu_btn, 2, i + 2, 1, 1);
+        control_rows[i].cpu_btn = cpu_btn;
+        control_rows[i].gpu_btn = gpu_btn;
     }
-    gtk_widget_show_all(indicator_menu);
-    //
-    indicator = app_indicator_new(NAME, "brasero",
+
+    gtk_widget_realize(fan_popup_window);
+    gtk_widget_show_all(fan_popup_window);
+    gtk_widget_hide(fan_popup_window);
+
+    /* ── GtkStatusIcon: XEmbed legacy tray icon, click shows fan_popup_window ── */
+    status_icon = gtk_status_icon_new_from_icon_name("utilities-system-monitor");
+    {
+        GdkPixbuf *fan_pb = ui_draw_fan_icon(22);
+        if (fan_pb)
+        {
+            gtk_status_icon_set_from_pixbuf(status_icon, fan_pb);
+            g_object_unref(fan_pb);
+        }
+    }
+    gtk_status_icon_set_visible(status_icon, TRUE);
+    g_signal_connect(status_icon, "popup-menu",
+                     G_CALLBACK(ui_status_icon_popup), NULL);
+    g_signal_connect(status_icon, "activate",
+                     G_CALLBACK(ui_status_icon_activate), NULL);
+
+    /* ── AppIndicator: KStatusNotifierItem — shows the live label text
+       in the GNOME panel bar.  Its menu only has the status header + Quit
+       because dbusmenu serialises menus over D-Bus and strips all custom
+       widget children (GtkHBox etc.); the real fan controls live in the
+       grab-free popup window above. ── */
+    GtkWidget *ai_menu = gtk_menu_new();
+    status_label = gtk_label_new("Init...");
+    GtkWidget *ai_status_item = gtk_menu_item_new();
+    gtk_widget_set_sensitive(ai_status_item, FALSE);
+    gtk_container_add(GTK_CONTAINER(ai_status_item), status_label);
+    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), ai_status_item);
+    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), gtk_separator_menu_item_new());
+    GtkWidget *ai_quit = gtk_menu_item_new_with_label("Quit");
+    g_signal_connect_swapped(ai_quit, "activate", G_CALLBACK(ui_command_quit), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), ai_quit);
+    gtk_widget_show_all(ai_menu);
+
+    indicator = app_indicator_new(NAME, "utilities-system-monitor",
                                   APP_INDICATOR_CATEGORY_HARDWARE);
-    g_assert(IS_APP_INDICATOR(indicator));
-    app_indicator_set_label(indicator, "Init..", "XX");
-    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ATTENTION);
-    app_indicator_set_ordering_index(indicator, -2);
-    app_indicator_set_title(indicator, "Clevo");
-    app_indicator_set_menu(indicator, GTK_MENU(indicator_menu));
+    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
+    app_indicator_set_menu(indicator, GTK_MENU(ai_menu));
+    app_indicator_set_label(indicator, "Init...",
+                            "C:000\xe2\x84\x83 000%  G:000\xe2\x84\x83 000%");
+
     g_timeout_add(500, &ui_update, NULL);
-    ui_toggle_menuitems(share_info->fan_duty);
+    ui_toggle_menuitems();
     gtk_main();
     printf("main on UI quit\n");
 }
@@ -836,35 +990,144 @@ static int main_test_gpu_fan(int duty_percentage)
 
 static gboolean ui_update(gpointer user_data)
 {
+    static char last_label[256] = "";
+
+    int disp_cpu_duty = (share_info->manual_next_cpu_fan_duty != 0)
+        ? share_info->manual_next_cpu_fan_duty : share_info->cpu_fan_duty;
+    int disp_gpu_duty = (share_info->manual_next_gpu_fan_duty != 0)
+        ? share_info->manual_next_gpu_fan_duty : share_info->gpu_fan_duty;
+
     char label[256];
-    sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp);
-    app_indicator_set_label(indicator, label, "XXXXXX");
-    char icon_name[256];
-    double load = ((double)share_info->fan_rpms) / MAX_FAN_RPM * 100.0;
-    double load_r = round(load / 5.0) * 5.0;
-    sprintf(icon_name, "brasero-disc-%02d", (int)load_r);
-    app_indicator_set_icon(indicator, icon_name);
+    snprintf(label, sizeof(label), "C:%d\xe2\x84\x83 %d%%  G:%d\xe2\x84\x83 %d%%",
+             share_info->cpu_temp, disp_cpu_duty,
+             share_info->gpu_temp, disp_gpu_duty);
+
+    if (strcmp(last_label, label) != 0)
+    {
+        snprintf(last_label, sizeof(last_label), "%s", label);
+        if (status_label)
+            gtk_label_set_text(GTK_LABEL(status_label), label);
+        /* Update AppIndicator label text in the panel bar */
+        if (indicator)
+            app_indicator_set_label(indicator, label,
+                                    "C:000\xe2\x84\x83 000%  G:000\xe2\x84\x83 000%");
+        /* Tooltip on the status icon for accessibility */
+        gtk_status_icon_set_tooltip_text(status_icon, label);
+    }
+    ui_toggle_menuitems();
     return G_SOURCE_CONTINUE;
 }
 
 static void ui_command_set_fan(long fan_duty)
 {
-    int fan_duty_val = (int)fan_duty;
+    int fan_index = FAN_CMD_FAN(fan_duty);
+    int fan_duty_val = FAN_CMD_DUTY(fan_duty);
+    if (fan_index != FAN_CPU && fan_index != FAN_GPU)
+        return;
+    const char *fan_name = (fan_index == FAN_CPU) ? "CPU" : "GPU";
+
     if (fan_duty_val == 0)
     {
-        printf("clicked on fan duty auto\n");
-        share_info->auto_duty = 1;
-        share_info->auto_duty_val = 0;
-        share_info->manual_next_fan_duty = 0;
+        printf("clicked on %s fan duty auto\n", fan_name);
+        if (fan_index == FAN_CPU)
+        {
+            share_info->auto_cpu_duty = 1;
+            share_info->auto_cpu_duty_val = 0;
+            share_info->manual_next_cpu_fan_duty = 0;
+        }
+        else
+        {
+            share_info->auto_gpu_duty = 1;
+            share_info->auto_gpu_duty_val = 0;
+            share_info->manual_next_gpu_fan_duty = 0;
+        }
     }
     else
     {
-        printf("clicked on fan duty: %d\n", fan_duty_val);
-        share_info->auto_duty = 0;
-        share_info->auto_duty_val = 0;
-        share_info->manual_next_fan_duty = fan_duty_val;
+        printf("clicked on %s fan duty: %d\n", fan_name, fan_duty_val);
+        if (fan_index == FAN_CPU)
+        {
+            share_info->auto_cpu_duty = 0;
+            share_info->auto_cpu_duty_val = 0;
+            share_info->manual_next_cpu_fan_duty = fan_duty_val;
+        }
+        else
+        {
+            share_info->auto_gpu_duty = 0;
+            share_info->auto_gpu_duty_val = 0;
+            share_info->manual_next_gpu_fan_duty = fan_duty_val;
+        }
     }
-    ui_toggle_menuitems(fan_duty_val);
+    ui_toggle_menuitems();
+}
+
+static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data)
+{
+    (void)btn;
+    ui_popup_hide();
+    ui_command_set_fan((long)GPOINTER_TO_INT(data));
+}
+
+static void ui_popup_show(void)
+{
+    if (gtk_widget_is_visible(fan_popup_window))
+    {
+        ui_popup_hide();
+        return;
+    }
+    GdkDisplay *display = gdk_display_get_default();
+    GdkSeat    *seat    = gdk_display_get_default_seat(display);
+    GdkDevice  *pointer = gdk_seat_get_pointer(seat);
+    gint x, y;
+    gdk_device_get_position(pointer, NULL, &x, &y);
+    gint px = x - 20, py = y + 4;
+
+    /* Pre-position hint before mapping */
+    gtk_window_move(GTK_WINDOW(fan_popup_window), px, py);
+    ui_toggle_menuitems();
+    gtk_widget_show(fan_popup_window);
+    /* Re-apply after the GdkWindow is mapped — some compositors ignore the
+       pre-show hint and place the window at (0,0) on first show */
+    GdkWindow *gdk_win = gtk_widget_get_window(fan_popup_window);
+    if (gdk_win)
+        gdk_window_move(gdk_win, px, py);
+    gtk_window_present(GTK_WINDOW(fan_popup_window));
+}
+
+static void ui_popup_hide(void)
+{
+    gtk_widget_hide(fan_popup_window);
+}
+
+static gboolean ui_popup_focus_out(GtkWidget *w, GdkEventFocus *e, gpointer d)
+{
+    (void)e; (void)d;
+    gtk_widget_hide(w);
+    return FALSE;
+}
+
+static gboolean ui_popup_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
+{
+    (void)d;
+    if (e->keyval == GDK_KEY_Escape)
+    {
+        gtk_widget_hide(w);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void ui_status_icon_popup(GtkStatusIcon *si, guint btn,
+                                  guint activate_time, gpointer data)
+{
+    (void)si; (void)btn; (void)activate_time; (void)data;
+    ui_popup_show();
+}
+
+static void ui_status_icon_activate(GtkStatusIcon *si, gpointer data)
+{
+    (void)si; (void)data;
+    ui_popup_show();
 }
 
 static void ui_command_quit(gchar *command)
@@ -873,18 +1136,82 @@ static void ui_command_quit(gchar *command)
     gtk_main_quit();
 }
 
-static void ui_toggle_menuitems(int fan_duty)
+/* Draw a 3-blade propeller fan icon into a size×size ARGB pixbuf.
+   Blades are white/semi-transparent arcs rotated 120° apart, with a
+   small hub circle in the centre. */
+static GdkPixbuf *ui_draw_fan_icon(int size)
 {
-    for (int i = 0; i < menuitem_count; i++)
+    cairo_surface_t *surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, size, size);
+    cairo_t *cr = cairo_create(surf);
+
+    double cx  = size / 2.0;
+    double cy  = size / 2.0;
+    double r   = size / 2.0 - 1.0;   /* outer radius */
+    double hub = size / 7.0;          /* hub radius */
+    int blades = 3;
+
+    /* transparent background */
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+
+    /* blades */
+    cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 0.92);
+    for (int i = 0; i < blades; i++)
     {
-        if (menuitems[i].widget == NULL)
+        double base = (2.0 * M_PI * i) / blades - M_PI / 2.0;
+        /* outer arc from base to base+110°, inner arc back narrower */
+        cairo_move_to(cr, cx + hub * cos(base), cy + hub * sin(base));
+        cairo_arc(cr, cx, cy, r,   base,              base + 1.9);
+        cairo_arc_negative(cr, cx, cy, hub, base + 1.9, base + 0.5);
+        cairo_close_path(cr);
+        cairo_fill(cr);
+    }
+
+    /* hub */
+    cairo_arc(cr, cx, cy, hub * 0.75, 0, 2.0 * M_PI);
+    cairo_fill(cr);
+
+    cairo_destroy(cr);
+    GdkPixbuf *pixbuf = gdk_pixbuf_get_from_surface(surf, 0, 0, size, size);
+    cairo_surface_destroy(surf);
+    return pixbuf;
+}
+
+static void ui_toggle_menuitems(void)
+{
+    if (fan_popup_window == NULL)
+        return;
+
+    int is_cpu_auto  = share_info->auto_cpu_duty;
+    int is_gpu_auto  = share_info->auto_gpu_duty;
+    int pending_cpu  = share_info->manual_next_cpu_fan_duty;
+    int pending_gpu  = share_info->manual_next_gpu_fan_duty;
+    int cpu_sel_duty = is_cpu_auto ? 0
+        : (pending_cpu  != 0 ? pending_cpu  : share_info->manual_prev_cpu_fan_duty);
+    int gpu_sel_duty = is_gpu_auto ? 0
+        : (pending_gpu != 0 ? pending_gpu : share_info->manual_prev_gpu_fan_duty);
+
+    for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
+    {
+        if (!control_rows[i].cpu_btn || !control_rows[i].gpu_btn)
             continue;
-        if (fan_duty == 0)
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                                     menuitems[i].type != AUTO);
-        else
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                                     menuitems[i].type != MANUAL || (int)menuitems[i].option != fan_duty);
+
+        int sel_cpu = (control_rows[i].type == AUTO)
+            ? is_cpu_auto
+            : (!is_cpu_auto && control_rows[i].duty == cpu_sel_duty);
+        int sel_gpu = (control_rows[i].type == AUTO)
+            ? is_gpu_auto
+            : (!is_gpu_auto && control_rows[i].duty == gpu_sel_duty);
+
+        char cpu_text[64], gpu_text[64];
+        snprintf(cpu_text, sizeof(cpu_text), "%s %s",
+                 sel_cpu ? "\xe2\x80\xa2" : " ", control_rows[i].label);
+        snprintf(gpu_text, sizeof(gpu_text), "%s %s",
+                 sel_gpu ? "\xe2\x80\xa2" : " ", control_rows[i].label);
+
+        gtk_button_set_label(GTK_BUTTON(control_rows[i].cpu_btn), cpu_text);
+        gtk_button_set_label(GTK_BUTTON(control_rows[i].gpu_btn), gpu_text);
     }
 }
 
@@ -904,44 +1231,48 @@ static void ec_on_sigterm(int signum)
         share_info->exit = 1;
 }
 
-static int ec_auto_duty_adjust(void)
+static int ec_auto_duty_adjust(int temp, int duty)
 {
-    int temp = MAX(share_info->cpu_temp, share_info->gpu_temp);
-    int duty = share_info->fan_duty;
+    int new_duty = duty;
     //
     if (temp >= 80 && duty < 100)
-        return 100;
-    if (temp >= 70 && duty < 90)
-        return 90;
-    if (temp >= 60 && duty < 80)
-        return 80;
-    if (temp >= 50 && duty < 70)
-        return 70;
-    if (temp >= 40 && duty < 60)
-        return 60;
-    if (temp >= 30 && duty < 50)
-        return 50;
-    if (temp >= 20 && duty < 40)
-        return 40;
-    if (temp >= 10 && duty < 30)
-        return 30;
+        new_duty = 100;
+    else if (temp >= 70 && duty < 90)
+        new_duty = 90;
+    else if (temp >= 60 && duty < 80)
+        new_duty = 80;
+    else if (temp >= 50 && duty < 70)
+        new_duty = 70;
+    else if (temp >= 40 && duty < 60)
+        new_duty = 60;
+    else if (temp >= 30 && duty < 50)
+        new_duty = 50;
+    else if (temp >= 20 && duty < 40)
+        new_duty = 40;
+    else if (temp >= 10 && duty < 30)
+        new_duty = 30;
     //
-    if (temp <= 15 && duty > 30)
-        return 30;
-    if (temp <= 25 && duty > 40)
-        return 40;
-    if (temp <= 35 && duty > 50)
-        return 50;
-    if (temp <= 45 && duty > 60)
-        return 60;
-    if (temp <= 55 && duty > 70)
-        return 70;
-    if (temp <= 65 && duty > 80)
-        return 80;
-    if (temp <= 75 && duty > 90)
-        return 90;
+    else if (temp <= 15 && duty > 30)
+        new_duty = 30;
+    else if (temp <= 25 && duty > 40)
+        new_duty = 40;
+    else if (temp <= 35 && duty > 50)
+        new_duty = 50;
+    else if (temp <= 45 && duty > 60)
+        new_duty = 60;
+    else if (temp <= 55 && duty > 70)
+        new_duty = 70;
+    else if (temp <= 65 && duty > 80)
+        new_duty = 80;
+    else if (temp <= 75 && duty > 90)
+        new_duty = 90;
+    else
+        return 0;
+
+    if (new_duty == duty)
+        return 0;
+    return new_duty;
     //
-    return 0;
 }
 
 static int ec_query_cpu_temp(void)
