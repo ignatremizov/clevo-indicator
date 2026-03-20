@@ -34,6 +34,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,9 +47,11 @@
 #include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #include <gtk/gtk.h>
 #include <cairo/cairo.h>
@@ -114,15 +119,11 @@ static int main_dump_fan(void);
 static int main_test_cpu_fan(int duty_percentage);
 static int main_test_gpu_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
+static void ui_on_reconnect(AppIndicator *ind, gboolean connected, gpointer data);
 static void ui_command_set_fan(long fan_duty);
-static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data);
-static void ui_popup_show(void);
-static void ui_popup_hide(void);
-static gboolean ui_popup_focus_out(GtkWidget *w, GdkEventFocus *e, gpointer d);
-static gboolean ui_popup_key_press(GtkWidget *w, GdkEventKey *e, gpointer d);
+static void ui_fan_item_activated(GtkMenuItem *item, gpointer data);
 static GdkPixbuf *ui_draw_fan_icon(int size);
-static void ui_status_icon_popup(GtkStatusIcon *si, guint btn, guint activate_time, gpointer data);
-static void ui_status_icon_activate(GtkStatusIcon *si, gpointer data);
+static const char *ui_setup_icon_theme(void);
 static void ui_command_quit(gchar *command);
 static void ui_toggle_menuitems(void);
 static void ec_on_sigterm(int signum);
@@ -148,10 +149,9 @@ static int check_proc_instances(const char *proc_name);
 static void get_time_string(char *buffer, size_t max, const char *format);
 static void signal_term(__sighandler_t handler);
 
-static GtkStatusIcon  *status_icon      = NULL;
-static AppIndicator   *indicator        = NULL;  /* label text in panel bar */
-static GtkWidget      *fan_popup_window = NULL;  /* grab-free two-column popup */
-static GtkWidget      *status_label     = NULL;
+static AppIndicator   *indicator_cpu    = NULL;  /* CPU fan control */
+static AppIndicator   *indicator_gpu    = NULL;  /* GPU fan control */
+static char ui_last_label[256] = "";
 #define MAX_FAN_ROWS 16
 
 typedef struct
@@ -159,8 +159,8 @@ typedef struct
     const char *label;
     int duty;
     MenuItemType type;
-    GtkWidget *cpu_btn;  /* GtkButton in the CPU column */
-    GtkWidget *gpu_btn;  /* GtkButton in the GPU column */
+    GtkWidget *cpu_item;  /* GtkMenuItem in the CPU fan indicator menu */
+    GtkWidget *gpu_item;  /* GtkMenuItem in the GPU fan indicator menu */
 } FanControlRow;
 
 static FanControlRow control_rows[] = {
@@ -698,18 +698,37 @@ static void main_init_share(void)
     share_info->manual_prev_gpu_fan_duty = 0;
 }
 
+static volatile int g_gpu_temp_smi = -1;
+
+static void *gpu_temp_smi_thread(void *arg)
+{
+    (void)arg;
+    while (1) {
+        int t = ec_query_gpu_temp_nvidia();
+        if (t > 0)
+            g_gpu_temp_smi = t;
+        sleep(1);
+    }
+    return NULL;
+}
+
 static int main_ec_worker(void)
 {
     setuid(0);
     system("modprobe ec_sys");
-    FILE *io_fd = fopen("/sys/kernel/debug/ec/ec0/io", "r");
-    if (io_fd <= 0)
+
+    if (use_gpu_temp_smi) {
+        pthread_t tid;
+        pthread_create(&tid, NULL, gpu_temp_smi_thread, NULL);
+        pthread_detach(tid);
+    }
+
+    int ec_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY);
+    if (ec_fd < 0)
     {
-        printf("unable to read EC from sysfs: %s\n", strerror(errno));
+        printf("unable to open EC sysfs: %s\n", strerror(errno));
         exit(EXIT_FAILURE);
     }
-    int gpu_smi_counter = 0;
-    int gpu_temp = -1;
     int initialized = 0;
     while (share_info->exit == 0)
     {
@@ -734,23 +753,22 @@ static int main_ec_worker(void)
             ec_write_gpu_fan_duty(new_gpu_fan_duty);
             share_info->manual_prev_gpu_fan_duty = new_gpu_fan_duty;
         }
-        // read EC
-        rewind(io_fd);
+        // read EC — lseek resets position directly on the fd without stdio buffering issues
+        lseek(ec_fd, 0, SEEK_SET);
         unsigned char buf[EC_REG_SIZE];
-        ssize_t len = fread(buf, 1, EC_REG_SIZE, io_fd);
+        ssize_t len = read(ec_fd, buf, EC_REG_SIZE);
         switch (len)
         {
         case -1:
-            printf("unable to read EC from sysfs: %s\n", strerror(errno));
+            printf("unable to read EC sysfs: %s\n", strerror(errno));
             break;
         case 0x100:
             share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
             if (use_gpu_temp_smi)
             {
-                if ((gpu_smi_counter++ % 5) == 0)
-                    gpu_temp = ec_query_gpu_temp_nvidia();
-                if (gpu_temp > 0)
-                    share_info->gpu_temp = gpu_temp;
+                int smi_temp = g_gpu_temp_smi;
+                if (smi_temp > 0)
+                    share_info->gpu_temp = smi_temp;
                 else
                     share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
             }
@@ -819,9 +837,76 @@ static int main_ec_worker(void)
         //
         usleep(200 * 1000);
     }
-    fclose(io_fd);
+    close(ec_fd);
     printf("worker quit\n");
     return EXIT_SUCCESS;
+}
+
+static const char *ui_setup_icon_theme(void)
+{
+    static const char *theme_dir = "/tmp/clevo-indicator-icons";
+    char icon_path[256];
+
+    mkdir("/tmp/clevo-indicator-icons", 0700);
+    mkdir("/tmp/clevo-indicator-icons/hicolor", 0700);
+    mkdir("/tmp/clevo-indicator-icons/hicolor/22x22", 0700);
+    mkdir("/tmp/clevo-indicator-icons/hicolor/22x22/apps", 0700);
+
+    /* GTK requires an index.theme in the root of the theme dir to recognise
+       it as a valid icon theme; without it icon lookups silently fail. */
+    snprintf(icon_path, sizeof(icon_path), "%s/hicolor/index.theme", theme_dir);
+    FILE *idx = fopen(icon_path, "w");
+    if (idx)
+    {
+        fprintf(idx,
+                "[Icon Theme]\n"
+                "Name=clevo-indicator\n"
+                "Directories=22x22/apps\n"
+                "\n"
+                "[22x22/apps]\n"
+                "Size=22\n"
+                "Type=Fixed\n");
+        fclose(idx);
+    }
+
+    GdkPixbuf *pb = ui_draw_fan_icon(22);
+    if (pb)
+    {
+        snprintf(icon_path, sizeof(icon_path),
+                 "%s/hicolor/22x22/apps/clevo-fan.png", theme_dir);
+        gdk_pixbuf_save(pb, icon_path, "png", NULL, NULL);
+        g_object_unref(pb);
+    }
+
+    /* 22×22 transparent icon — renders as nothing in the panel so only
+       the label text (with embedded 🌀 emoji) is visible */
+    cairo_surface_t *blank_surf =
+        cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 22, 22);
+    cairo_t *blank_cr = cairo_create(blank_surf);
+    cairo_set_source_rgba(blank_cr, 0, 0, 0, 0);
+    cairo_paint(blank_cr);
+    cairo_destroy(blank_cr);
+    GdkPixbuf *blank_pb = gdk_pixbuf_get_from_surface(blank_surf, 0, 0, 22, 22);
+    cairo_surface_destroy(blank_surf);
+    if (blank_pb)
+    {
+        snprintf(icon_path, sizeof(icon_path),
+                 "%s/hicolor/22x22/apps/clevo-blank.png", theme_dir);
+        gdk_pixbuf_save(blank_pb, icon_path, "png", NULL, NULL);
+        g_object_unref(blank_pb);
+    }
+
+    /* Use the Cairo-drawn fan icon for the CPU indicator */
+    GdkPixbuf *cyclone_pb = ui_draw_fan_icon(22);
+    if (cyclone_pb)
+    {
+        snprintf(icon_path, sizeof(icon_path),
+                 "%s/hicolor/22x22/apps/clevo-cyclone.png", theme_dir);
+        gdk_pixbuf_save(cyclone_pb, icon_path, "png", NULL, NULL);
+        g_object_unref(cyclone_pb);
+    }
+
+    return theme_dir;
 }
 
 static void main_ui_worker(int argc, char **argv)
@@ -831,113 +916,69 @@ static void main_ui_worker(int argc, char **argv)
     setuid(desktop_uid);
     gtk_init(&argc, &argv);
 
-    /* ── Fan control popup window
-       GTK_WINDOW_TOPLEVEL + POPUP_MENU hint: the WM places it undecorated
-       and above other windows but does NOT take a keyboard grab, so global
-       hotkeys (PrintScreen, etc.) keep working.  A GtkMenu would take an
-       exclusive seat grab on X11 and block all keyboard events. ── */
-    fan_popup_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_decorated(GTK_WINDOW(fan_popup_window), FALSE);
-    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(fan_popup_window), TRUE);
-    gtk_window_set_skip_pager_hint(GTK_WINDOW(fan_popup_window), TRUE);
-    gtk_window_set_keep_above(GTK_WINDOW(fan_popup_window), TRUE);
-    gtk_window_set_type_hint(GTK_WINDOW(fan_popup_window),
-                             GDK_WINDOW_TYPE_HINT_POPUP_MENU);
-    gtk_container_set_border_width(GTK_CONTAINER(fan_popup_window), 0);
-    g_signal_connect(fan_popup_window, "focus-out-event",
-                     G_CALLBACK(ui_popup_focus_out), NULL);
-    g_signal_connect(fan_popup_window, "key-press-event",
-                     G_CALLBACK(ui_popup_key_press), NULL);
+    const char *fan_icon_theme = ui_setup_icon_theme();
 
-    GtkWidget *frame = gtk_frame_new(NULL);
-    gtk_frame_set_shadow_type(GTK_FRAME(frame), GTK_SHADOW_ETCHED_OUT);
-    gtk_container_add(GTK_CONTAINER(fan_popup_window), frame);
+    /* Panel stacks right-to-left: first created = rightmost.
+       Create GPU first so it appears on the right, CPU second so it
+       appears on the left. */
 
-    GtkWidget *outer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 0);
-    gtk_container_set_border_width(GTK_CONTAINER(outer_box), 8);
-    gtk_container_add(GTK_CONTAINER(frame), outer_box);
-
-    GtkWidget *grid = gtk_grid_new();
-    gtk_grid_set_column_spacing(GTK_GRID(grid), 2);
-    gtk_grid_set_row_spacing(GTK_GRID(grid), 2);
-    gtk_box_pack_start(GTK_BOX(outer_box), grid, TRUE, TRUE, 0);
-
-    /* Column headers */
-    GtkWidget *cpu_hdr = gtk_label_new("CPU Fan");
-    GtkWidget *gpu_hdr = gtk_label_new("GPU Fan");
-    gtk_widget_set_hexpand(cpu_hdr, TRUE);
-    gtk_widget_set_hexpand(gpu_hdr, TRUE);
-    gtk_grid_attach(GTK_GRID(grid), cpu_hdr, 0, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid),
-                    gtk_separator_new(GTK_ORIENTATION_VERTICAL), 1, 0,
-                    1, control_rows_count + 2);
-    gtk_grid_attach(GTK_GRID(grid), gpu_hdr, 2, 0, 1, 1);
-    gtk_grid_attach(GTK_GRID(grid),
-                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL), 0, 1, 3, 1);
-
-    /* Button rows */
-    for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
+    /* ── AppIndicator 1 (rightmost): GPU fan control ── */
+    GtkWidget *gpu_menu = gtk_menu_new();
+    gtk_menu_set_reserve_toggle_size(GTK_MENU(gpu_menu), FALSE);
+    for (int i = 0; i < control_rows_count; i++)
     {
-        GtkWidget *cpu_btn = gtk_button_new_with_label(control_rows[i].label);
-        GtkWidget *gpu_btn = gtk_button_new_with_label(control_rows[i].label);
-        gtk_button_set_relief(GTK_BUTTON(cpu_btn), GTK_RELIEF_NONE);
-        gtk_button_set_relief(GTK_BUTTON(gpu_btn), GTK_RELIEF_NONE);
-        gtk_widget_set_hexpand(cpu_btn, TRUE);
-        gtk_widget_set_hexpand(gpu_btn, TRUE);
-        g_signal_connect(cpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
-                         GINT_TO_POINTER(FAN_COMMAND(FAN_CPU, control_rows[i].duty)));
-        g_signal_connect(gpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
+        GtkWidget *item = gtk_menu_item_new_with_label(control_rows[i].label);
+        g_signal_connect(item, "activate", G_CALLBACK(ui_fan_item_activated),
                          GINT_TO_POINTER(FAN_COMMAND(FAN_GPU, control_rows[i].duty)));
-        gtk_grid_attach(GTK_GRID(grid), cpu_btn, 0, i + 2, 1, 1);
-        gtk_grid_attach(GTK_GRID(grid), gpu_btn, 2, i + 2, 1, 1);
-        control_rows[i].cpu_btn = cpu_btn;
-        control_rows[i].gpu_btn = gpu_btn;
+        gtk_menu_shell_append(GTK_MENU_SHELL(gpu_menu), item);
+        control_rows[i].gpu_item = item;
     }
+    gtk_menu_shell_append(GTK_MENU_SHELL(gpu_menu), gtk_separator_menu_item_new());
+    GtkWidget *gpu_quit = gtk_menu_item_new_with_label("Quit");
+    g_signal_connect_swapped(gpu_quit, "activate", G_CALLBACK(ui_command_quit), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(gpu_menu), gpu_quit);
+    gtk_widget_show_all(gpu_menu);
 
-    gtk_widget_realize(fan_popup_window);
-    gtk_widget_show_all(fan_popup_window);
-    gtk_widget_hide(fan_popup_window);
+    /* 🌀 icon for CPU; blank (→ ...) for GPU; ° = \xc2\xb0 */
+    indicator_gpu = app_indicator_new(NAME "-gpu", "clevo-blank",
+                                      APP_INDICATOR_CATEGORY_HARDWARE);
+    app_indicator_set_icon_theme_path(indicator_gpu, fan_icon_theme);
+    app_indicator_set_status(indicator_gpu, APP_INDICATOR_STATUS_ACTIVE);
+    app_indicator_set_menu(indicator_gpu, GTK_MENU(gpu_menu));
+    app_indicator_set_label(indicator_gpu,
+                            "G:--\xc2\xb0 --% \xf0\x9f\x8c\x80",
+                            "G:000\xc2\xb0 100% \xf0\x9f\x8c\x80");
 
-    /* ── GtkStatusIcon: XEmbed legacy tray icon, click shows fan_popup_window ── */
-    status_icon = gtk_status_icon_new_from_icon_name("utilities-system-monitor");
+    /* ── AppIndicator 2 (leftmost): CPU fan control ── */
+    GtkWidget *cpu_menu = gtk_menu_new();
+    gtk_menu_set_reserve_toggle_size(GTK_MENU(cpu_menu), FALSE);
+    for (int i = 0; i < control_rows_count; i++)
     {
-        GdkPixbuf *fan_pb = ui_draw_fan_icon(22);
-        if (fan_pb)
-        {
-            gtk_status_icon_set_from_pixbuf(status_icon, fan_pb);
-            g_object_unref(fan_pb);
-        }
+        GtkWidget *item = gtk_menu_item_new_with_label(control_rows[i].label);
+        g_signal_connect(item, "activate", G_CALLBACK(ui_fan_item_activated),
+                         GINT_TO_POINTER(FAN_COMMAND(FAN_CPU, control_rows[i].duty)));
+        gtk_menu_shell_append(GTK_MENU_SHELL(cpu_menu), item);
+        control_rows[i].cpu_item = item;
     }
-    gtk_status_icon_set_visible(status_icon, TRUE);
-    g_signal_connect(status_icon, "popup-menu",
-                     G_CALLBACK(ui_status_icon_popup), NULL);
-    g_signal_connect(status_icon, "activate",
-                     G_CALLBACK(ui_status_icon_activate), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(cpu_menu), gtk_separator_menu_item_new());
+    GtkWidget *cpu_quit = gtk_menu_item_new_with_label("Quit");
+    g_signal_connect_swapped(cpu_quit, "activate", G_CALLBACK(ui_command_quit), NULL);
+    gtk_menu_shell_append(GTK_MENU_SHELL(cpu_menu), cpu_quit);
+    gtk_widget_show_all(cpu_menu);
 
-    /* ── AppIndicator: KStatusNotifierItem — shows the live label text
-       in the GNOME panel bar.  Its menu only has the status header + Quit
-       because dbusmenu serialises menus over D-Bus and strips all custom
-       widget children (GtkHBox etc.); the real fan controls live in the
-       grab-free popup window above. ── */
-    GtkWidget *ai_menu = gtk_menu_new();
-    status_label = gtk_label_new("Init...");
-    GtkWidget *ai_status_item = gtk_menu_item_new();
-    gtk_widget_set_sensitive(ai_status_item, FALSE);
-    gtk_container_add(GTK_CONTAINER(ai_status_item), status_label);
-    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), ai_status_item);
-    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), gtk_separator_menu_item_new());
-    GtkWidget *ai_quit = gtk_menu_item_new_with_label("Quit");
-    g_signal_connect_swapped(ai_quit, "activate", G_CALLBACK(ui_command_quit), NULL);
-    gtk_menu_shell_append(GTK_MENU_SHELL(ai_menu), ai_quit);
-    gtk_widget_show_all(ai_menu);
+    indicator_cpu = app_indicator_new(NAME "-cpu", "clevo-blank",
+                                      APP_INDICATOR_CATEGORY_HARDWARE);
+    app_indicator_set_icon_theme_path(indicator_cpu, fan_icon_theme);
+    app_indicator_set_status(indicator_cpu, APP_INDICATOR_STATUS_ACTIVE);
+    app_indicator_set_menu(indicator_cpu, GTK_MENU(cpu_menu));
+    app_indicator_set_label(indicator_cpu,
+                            "\xf0\x9f\x8c\x80 C:--\xc2\xb0 --%",
+                            "\xf0\x9f\x8c\x80 C:000\xc2\xb0 100%");
 
-    indicator = app_indicator_new(NAME, "utilities-system-monitor",
-                                  APP_INDICATOR_CATEGORY_HARDWARE);
-    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
-    app_indicator_set_menu(indicator, GTK_MENU(ai_menu));
-    app_indicator_set_label(indicator, "Init...",
-                            "C:000\xe2\x84\x83 000%  G:000\xe2\x84\x83 000%");
-
+    g_signal_connect(indicator_cpu, "connection-changed",
+                     G_CALLBACK(ui_on_reconnect), NULL);
+    g_signal_connect(indicator_gpu, "connection-changed",
+                     G_CALLBACK(ui_on_reconnect), NULL);
     g_timeout_add(500, &ui_update, NULL);
     ui_toggle_menuitems();
     gtk_main();
@@ -990,32 +1031,46 @@ static int main_test_gpu_fan(int duty_percentage)
 
 static gboolean ui_update(gpointer user_data)
 {
-    static char last_label[256] = "";
-
     int disp_cpu_duty = (share_info->manual_next_cpu_fan_duty != 0)
         ? share_info->manual_next_cpu_fan_duty : share_info->cpu_fan_duty;
     int disp_gpu_duty = (share_info->manual_next_gpu_fan_duty != 0)
         ? share_info->manual_next_gpu_fan_duty : share_info->gpu_fan_duty;
 
     char label[256];
-    snprintf(label, sizeof(label), "C:%d\xe2\x84\x83 %d%%  G:%d\xe2\x84\x83 %d%%",
+    snprintf(label, sizeof(label), "C:%d\xc2\xb0 %d%%  G:%d\xc2\xb0 %d%%",
              share_info->cpu_temp, disp_cpu_duty,
              share_info->gpu_temp, disp_gpu_duty);
 
-    if (strcmp(last_label, label) != 0)
+    if (strcmp(ui_last_label, label) != 0)
     {
-        snprintf(last_label, sizeof(last_label), "%s", label);
-        if (status_label)
-            gtk_label_set_text(GTK_LABEL(status_label), label);
-        /* Update AppIndicator label text in the panel bar */
-        if (indicator)
-            app_indicator_set_label(indicator, label,
-                                    "C:000\xe2\x84\x83 000%  G:000\xe2\x84\x83 000%");
-        /* Tooltip on the status icon for accessibility */
-        gtk_status_icon_set_tooltip_text(status_icon, label);
+        snprintf(ui_last_label, sizeof(ui_last_label), "%s", label);
+        if (indicator_cpu)
+        {
+            char cpu_lbl[32];
+            snprintf(cpu_lbl, sizeof(cpu_lbl), "\xf0\x9f\x8c\x80 C:%d\xc2\xb0 %d%%",
+                     share_info->cpu_temp, disp_cpu_duty);
+            app_indicator_set_label(indicator_cpu, cpu_lbl, "\xf0\x9f\x8c\x80 C:000\xc2\xb0 100%");
+        }
+        if (indicator_gpu)
+        {
+            char gpu_lbl[32];
+            snprintf(gpu_lbl, sizeof(gpu_lbl), "G:%d\xc2\xb0 %d%% \xf0\x9f\x8c\x80",
+                     share_info->gpu_temp, disp_gpu_duty);
+            app_indicator_set_label(indicator_gpu, gpu_lbl,
+                                    "G:000\xc2\xb0 100% \xf0\x9f\x8c\x80");
+        }
     }
     ui_toggle_menuitems();
     return G_SOURCE_CONTINUE;
+}
+
+/* Called when the panel notifier host connects or disconnects.
+   On reconnect we clear the cached label so ui_update pushes it again. */
+static void ui_on_reconnect(AppIndicator *ind, gboolean connected, gpointer data)
+{
+    (void)ind; (void)data;
+    if (connected)
+        ui_last_label[0] = '\0';
 }
 
 static void ui_command_set_fan(long fan_duty)
@@ -1061,73 +1116,10 @@ static void ui_command_set_fan(long fan_duty)
     ui_toggle_menuitems();
 }
 
-static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data)
+static void ui_fan_item_activated(GtkMenuItem *item, gpointer data)
 {
-    (void)btn;
-    ui_popup_hide();
+    (void)item;
     ui_command_set_fan((long)GPOINTER_TO_INT(data));
-}
-
-static void ui_popup_show(void)
-{
-    if (gtk_widget_is_visible(fan_popup_window))
-    {
-        ui_popup_hide();
-        return;
-    }
-    GdkDisplay *display = gdk_display_get_default();
-    GdkSeat    *seat    = gdk_display_get_default_seat(display);
-    GdkDevice  *pointer = gdk_seat_get_pointer(seat);
-    gint x, y;
-    gdk_device_get_position(pointer, NULL, &x, &y);
-    gint px = x - 20, py = y + 4;
-
-    /* Pre-position hint before mapping */
-    gtk_window_move(GTK_WINDOW(fan_popup_window), px, py);
-    ui_toggle_menuitems();
-    gtk_widget_show(fan_popup_window);
-    /* Re-apply after the GdkWindow is mapped — some compositors ignore the
-       pre-show hint and place the window at (0,0) on first show */
-    GdkWindow *gdk_win = gtk_widget_get_window(fan_popup_window);
-    if (gdk_win)
-        gdk_window_move(gdk_win, px, py);
-    gtk_window_present(GTK_WINDOW(fan_popup_window));
-}
-
-static void ui_popup_hide(void)
-{
-    gtk_widget_hide(fan_popup_window);
-}
-
-static gboolean ui_popup_focus_out(GtkWidget *w, GdkEventFocus *e, gpointer d)
-{
-    (void)e; (void)d;
-    gtk_widget_hide(w);
-    return FALSE;
-}
-
-static gboolean ui_popup_key_press(GtkWidget *w, GdkEventKey *e, gpointer d)
-{
-    (void)d;
-    if (e->keyval == GDK_KEY_Escape)
-    {
-        gtk_widget_hide(w);
-        return TRUE;
-    }
-    return FALSE;
-}
-
-static void ui_status_icon_popup(GtkStatusIcon *si, guint btn,
-                                  guint activate_time, gpointer data)
-{
-    (void)si; (void)btn; (void)activate_time; (void)data;
-    ui_popup_show();
-}
-
-static void ui_status_icon_activate(GtkStatusIcon *si, gpointer data)
-{
-    (void)si; (void)data;
-    ui_popup_show();
 }
 
 static void ui_command_quit(gchar *command)
@@ -1136,9 +1128,7 @@ static void ui_command_quit(gchar *command)
     gtk_main_quit();
 }
 
-/* Draw a 3-blade propeller fan icon into a size×size ARGB pixbuf.
-   Blades are white/semi-transparent arcs rotated 120° apart, with a
-   small hub circle in the centre. */
+/* Draw a 3-blade propeller fan icon into a size×size ARGB pixbuf. */
 static GdkPixbuf *ui_draw_fan_icon(int size)
 {
     cairo_surface_t *surf =
@@ -1180,7 +1170,7 @@ static GdkPixbuf *ui_draw_fan_icon(int size)
 
 static void ui_toggle_menuitems(void)
 {
-    if (fan_popup_window == NULL)
+    if (!indicator_cpu || !indicator_gpu)
         return;
 
     int is_cpu_auto  = share_info->auto_cpu_duty;
@@ -1194,7 +1184,7 @@ static void ui_toggle_menuitems(void)
 
     for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
     {
-        if (!control_rows[i].cpu_btn || !control_rows[i].gpu_btn)
+        if (!control_rows[i].cpu_item || !control_rows[i].gpu_item)
             continue;
 
         int sel_cpu = (control_rows[i].type == AUTO)
@@ -1210,8 +1200,8 @@ static void ui_toggle_menuitems(void)
         snprintf(gpu_text, sizeof(gpu_text), "%s %s",
                  sel_gpu ? "\xe2\x80\xa2" : " ", control_rows[i].label);
 
-        gtk_button_set_label(GTK_BUTTON(control_rows[i].cpu_btn), cpu_text);
-        gtk_button_set_label(GTK_BUTTON(control_rows[i].gpu_btn), gpu_text);
+        gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].cpu_item), cpu_text);
+        gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].gpu_item), gpu_text);
     }
 }
 
