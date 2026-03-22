@@ -57,6 +57,8 @@
 #include <cairo/cairo.h>
 #include <libayatana-appindicator/app-indicator.h>
 
+#include "sni.h"
+
 #define NAME "clevo-indicator"
 
 #define EC_SC 0x66
@@ -120,6 +122,9 @@ static int main_test_cpu_fan(int duty_percentage);
 static int main_test_gpu_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
 static void ui_on_reconnect(AppIndicator *ind, gboolean connected, gpointer data);
+static void ui_sni_activate(int x, int y, void *user_data);
+static void ui_sni_context_menu(int x, int y, void *user_data);
+static void ui_sni_secondary_activate(int x, int y, void *user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_fan_item_activated(GtkMenuItem *item, gpointer data);
 static GdkPixbuf *ui_draw_fan_icon(int size);
@@ -151,6 +156,7 @@ static void signal_term(__sighandler_t handler);
 
 static AppIndicator   *indicator_cpu    = NULL;  /* CPU fan control */
 static AppIndicator   *indicator_gpu    = NULL;  /* GPU fan control */
+static ClevoSni       *experimental_sni = NULL;  /* Opt-in native SNI scaffold */
 static char ui_last_label[256] = "";
 #define MAX_FAN_ROWS 16
 
@@ -916,6 +922,30 @@ static void main_ui_worker(int argc, char **argv)
     setuid(desktop_uid);
     gtk_init(&argc, &argv);
 
+    if (g_getenv("CLEVO_EXPERIMENTAL_SNI"))
+    {
+        ClevoSniHandlers handlers = {
+            .activate = ui_sni_activate,
+            .context_menu = ui_sni_context_menu,
+            .secondary_activate = ui_sni_secondary_activate,
+        };
+        experimental_sni = clevo_sni_new(&handlers, NULL);
+        if (experimental_sni)
+        {
+            clevo_sni_set_title(experimental_sni, "Clevo Indicator");
+            clevo_sni_set_status(experimental_sni, "Active");
+            clevo_sni_set_show_icon(experimental_sni, FALSE);
+            clevo_sni_set_prefer_activate(experimental_sni, TRUE);
+            printf("experimental SNI enabled: %s%s\n",
+                   clevo_sni_get_bus_name(experimental_sni),
+                   clevo_sni_get_object_path(experimental_sni));
+        }
+        else
+        {
+            printf("experimental SNI init failed\n");
+        }
+    }
+
     const char *fan_icon_theme = ui_setup_icon_theme();
 
     /* Panel stacks right-to-left: first created = rightmost.
@@ -1044,6 +1074,12 @@ static gboolean ui_update(gpointer user_data)
     if (strcmp(ui_last_label, label) != 0)
     {
         snprintf(ui_last_label, sizeof(ui_last_label), "%s", label);
+        if (experimental_sni)
+        {
+            clevo_sni_set_label(experimental_sni,
+                                label,
+                                "C:000\xc2\xb0 100%  G:000\xc2\xb0 100%");
+        }
         if (indicator_cpu)
         {
             char cpu_lbl[32];
@@ -1124,8 +1160,32 @@ static void ui_fan_item_activated(GtkMenuItem *item, gpointer data)
 
 static void ui_command_quit(gchar *command)
 {
+    (void)command;
     printf("clicked on quit\n");
+    if (experimental_sni)
+    {
+        clevo_sni_free(experimental_sni);
+        experimental_sni = NULL;
+    }
     gtk_main_quit();
+}
+
+static void ui_sni_activate(int x, int y, void *user_data)
+{
+    (void)user_data;
+    printf("SNI activate at %d,%d (custom popup hook not wired yet)\n", x, y);
+}
+
+static void ui_sni_context_menu(int x, int y, void *user_data)
+{
+    (void)user_data;
+    printf("SNI context menu at %d,%d\n", x, y);
+}
+
+static void ui_sni_secondary_activate(int x, int y, void *user_data)
+{
+    (void)user_data;
+    printf("SNI secondary activate at %d,%d\n", x, y);
 }
 
 /* Draw a 3-blade propeller fan icon into a size×size ARGB pixbuf. */

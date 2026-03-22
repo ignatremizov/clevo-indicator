@@ -8,7 +8,7 @@ DSTDIR := /usr/local
 OBJDIR := obj
 SRCDIR := src
 
-SRC = clevo-indicator.c
+SRC = clevo-indicator.c sni.c
 OBJ = $(patsubst %.c,$(OBJDIR)/%.o,$(SRC)) 
 
 TARGET = bin/clevo-indicator
