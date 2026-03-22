@@ -21,6 +21,7 @@ void clevo_sni_set_status(ClevoSni *sni, const char *status);
 void clevo_sni_set_icon_name(ClevoSni *sni, const char *icon_name);
 void clevo_sni_set_show_icon(ClevoSni *sni, gboolean show_icon);
 void clevo_sni_set_prefer_activate(ClevoSni *sni, gboolean prefer_activate);
+char *clevo_sni_take_activation_token(ClevoSni *sni);
 
 const char *clevo_sni_get_bus_name(ClevoSni *sni);
 const char *clevo_sni_get_object_path(ClevoSni *sni);

@@ -24,6 +24,7 @@ struct ClevoSni
     char *label;
     char *label_guide;
     char *icon_name;
+    char *activation_token;
     gboolean show_icon;
     gboolean prefer_activate;
 
@@ -181,8 +182,17 @@ static void clevo_sni_handle_method_call(GDBusConnection *connection,
         return;
     }
 
-    if (g_strcmp0(method_name, "ProvideXdgActivationToken") == 0 ||
-        g_strcmp0(method_name, "XAyatanaSecondaryActivate") == 0 ||
+    if (g_strcmp0(method_name, "ProvideXdgActivationToken") == 0)
+    {
+        const char *token = "";
+        g_variant_get(parameters, "(&s)", &token);
+        g_free(sni->activation_token);
+        sni->activation_token = g_strdup(token);
+        g_dbus_method_invocation_return_value(invocation, NULL);
+        return;
+    }
+
+    if (g_strcmp0(method_name, "XAyatanaSecondaryActivate") == 0 ||
         g_strcmp0(method_name, "Scroll") == 0)
     {
         g_dbus_method_invocation_return_value(invocation, NULL);
@@ -235,7 +245,7 @@ static void clevo_sni_register_with_watcher(ClevoSni *sni, const char *watcher_n
 {
     GError *error = NULL;
 
-    if (!sni || !sni->connection || !sni->bus_name)
+    if (!sni || !sni->connection)
         return;
 
     g_dbus_connection_call_sync(sni->connection,
@@ -243,7 +253,7 @@ static void clevo_sni_register_with_watcher(ClevoSni *sni, const char *watcher_n
                                 CLEVO_SNI_WATCHER_PATH,
                                 watcher_name,
                                 "RegisterStatusNotifierItem",
-                                g_variant_new("(s)", sni->bus_name),
+                                g_variant_new("(s)", CLEVO_SNI_OBJECT_PATH),
                                 NULL,
                                 G_DBUS_CALL_FLAGS_NONE,
                                 -1,
@@ -308,6 +318,7 @@ ClevoSni *clevo_sni_new(const ClevoSniHandlers *handlers, void *user_data)
     sni->label = g_strdup("");
     sni->label_guide = g_strdup("");
     sni->icon_name = g_strdup("");
+    sni->activation_token = NULL;
     sni->show_icon = FALSE;
     sni->prefer_activate = TRUE;
     sni->user_data = user_data;
@@ -383,6 +394,7 @@ void clevo_sni_free(ClevoSni *sni)
     g_free(sni->label);
     g_free(sni->label_guide);
     g_free(sni->icon_name);
+    g_free(sni->activation_token);
     g_free(sni);
 }
 
@@ -463,6 +475,18 @@ void clevo_sni_set_prefer_activate(ClevoSni *sni, gboolean prefer_activate)
         sni,
         "XClevoPreferActivate", g_variant_new_boolean(sni->prefer_activate),
         NULL, NULL);
+}
+
+char *clevo_sni_take_activation_token(ClevoSni *sni)
+{
+    char *token;
+
+    if (!sni)
+        return NULL;
+
+    token = sni->activation_token;
+    sni->activation_token = NULL;
+    return token;
 }
 
 const char *clevo_sni_get_bus_name(ClevoSni *sni)

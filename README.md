@@ -1,120 +1,177 @@
 # Clevo Laptop Fan Speed Utility
 
-Fan speed utility for Clevo laptops, supports CPU/GPU.
+Control CPU and GPU fans on supported Clevo laptops.
 
-Based on:
+Use the project to:
+
+- read CPU/GPU temperature, duty, and RPM values
+- set CPU and GPU fan duty manually from the CLI
+- run automatic fan control based on the hottest component
+- open a GNOME panel indicator with a dual-column CPU/GPU control popup
+
+Build on top of:
 
 - https://github.com/davidrohr/clevo-indicator
 - https://github.com/SkyLandTW/clevo-indicator
 
-Recent changes:
-
-- Unlocked manual GUI fan minimum to 40%.
-- Expanded documentation and exposed additional tuning parameters.
-
 ## Build
 
-```bash
-# For Ubuntu/Debian
-sudo apt install libappindicator3-dev libgtk-3-dev
-git clone https://github.com/gzzchh/clevo-indicator
-cd clevo-indicator
-make install
-```
+Install the build dependencies required by the build:
 
 ```bash
-# For CentOS/Fedora
-sudo dnf install \
-libappindicator-gtk3-devel \
-libappindicator-gtk3 \
-libappindicator \
-libappindicator-devel
-git clone https://github.com/gzzchh/clevo-indicator
-cd clevo-indicator
-make install
+sudo apt install build-essential pkg-config libgtk-3-dev libayatana-appindicator3-dev
 ```
 
-## Usage
+Build the project:
 
-clevo-indicator set [fan-duty-percentage(int)] Set CPU fan percentage  
-clevo-indicator setg [fan-duty-percentage(int)] Set GPU fan percentage  
-clevo-indicator help Show help  
-clevo-indicator dump Get temperatures  
-clevo-indicator dumpall Get raw temperature data  
-clevo-indicator auto Auto-adjust fan speed and exit (for scheduled scripts)  
-clevo-indicator indicator Show GUI fan control
+```bash
+git clone https://github.com/gzzchh/clevo-indicator
+cd clevo-indicator
+make
+```
 
-fan-duty-percentage is an integer value  
-Specifies target fan duty percentage.
+On distributions other than Ubuntu/Debian, install packages that provide these `pkg-config` targets:
+
+- `gtk+-3.0`
+- `ayatana-appindicator3-0.1`
+
+## Install
+
+Install the binary with the setuid-root mode required for EC access:
+
+```bash
+sudo make install
+```
+
+The install target places the binary at:
+
+```text
+/usr/local/bin/clevo-indicator
+```
+
+## Run
+
+Use the CLI commands directly:
+
+```text
+clevo-indicator set [fan-duty-percentage]
+clevo-indicator setg [fan-duty-percentage]
+clevo-indicator dump
+clevo-indicator dumpall
+clevo-indicator auto
+clevo-indicator indicator
+clevo-indicator help
+```
+
+Use `fan-duty-percentage` as an integer percentage value.
+
+Examples:
+
+```bash
+clevo-indicator dump
+clevo-indicator set 70
+clevo-indicator setg 80
+clevo-indicator auto
+/usr/local/bin/clevo-indicator indicator
+```
+
+## Use The GNOME Panel UI
+
+Run the indicator with:
+
+```bash
+/usr/local/bin/clevo-indicator indicator
+```
+
+Expect the default UI to provide:
+
+- one combined top-bar label
+- one custom popup window
+- separate CPU and GPU control columns
+- presets `AUTO`, `40%`, `50%`, `60%`, `70%`, `80%`, `90%`, `100%`
+
+### Install The Required GNOME Host Fork
+
+Use the patched GNOME AppIndicators host extension. Stock GNOME AppIndicators do not provide the required behavior for this UI.
+
+Required host behavior:
+
+- hide the icon actor completely
+- route primary click to `Activate(x, y)` instead of always opening DBusMenu
+
+Use this fork:
+
+- GitHub: `git@github.com:ignatremizov/gnome-shell-extension-appindicator.git`
+- local clone: `~/code/gnome-shell-extension-appindicator`
+- local extension UUID: `appindicatorsupport@ignatremizov.com`
+- local install path:
+  `~/.local/share/gnome-shell/extensions/appindicatorsupport@ignatremizov.com`
+
+Treat the single-indicator UI as a two-part system:
+
+1. export a native `StatusNotifierItem` from this repo
+2. consume `XClevoShowIcon=false` and `XClevoPreferActivate=true` in the patched GNOME host
+
+Read [docs/SNI_HOST_PATCH.md](docs/SNI_HOST_PATCH.md) for the host-side details.
+
+### Force The Legacy UI
+
+Force the dual-AppIndicator fallback for compatibility or debugging:
+
+```bash
+CLEVO_LEGACY_APPINDICATOR=1 /usr/local/bin/clevo-indicator indicator
+```
+
+Use that mode when the patched GNOME host fork is unavailable or when you want to compare the old flat-menu behavior.
+
+## Screenshots
+
+Default single-indicator UI:
+
+![Single-indicator UI](assets/sni-single-indicator-ui.png)
+
+Legacy dual-AppIndicator UI:
+
+![Legacy dual-AppIndicator UI](assets/legacy-dual-appindicator-ui.png)
+
+## Privilege Model And Safety
+
+Run the indicator as the desktop user. Let the installed setuid bit supply the root privileges required for EC access.
+
+The binary must do both of these jobs:
+
+- run UI code as the desktop user so GNOME can show the indicator
+- access Clevo EC interfaces with root privileges
+
+That split causes the process tree to fork into a UI side and a privileged worker side. Killing either process will terminate the other.
+
+Do not run other EC-tweaking tools at the same time. This project does not coordinate low-level EC access across multiple processes.
+
+Avoid `kill -9` unless there is no other recovery path.
 
 ## Contributing
 
-Development workflow and commit message conventions are documented in [CONTRIBUTING.md](CONTRIBUTING.md).
+Read [CONTRIBUTING.md](CONTRIBUTING.md) for workflow and commit-message conventions.
 
-## Note
-
-The EC interface requires root privileges, while most Linux desktop sessions run
-as normal users, so this binary needs setuid.
-
-Set it up like this:
-
-```bash
-sudo chown root clevo-indicator
-sudo chmod u+s  clevo-indicator
-```
-
-This program conflicts with other tools that access EC through low-level calls,
-and may cause unstable behavior.  
-There is no additional protection around EC access in this project.
-
-The executable has setuid flag on, but must be run by the current desktop user,
-because only the desktop user is allowed to display a desktop indicator in
-Ubuntu, while a non-root user is not allowed to control Clevo EC by low-level
-IO ports. The setuid=root creates a special situation in which this program can
-fork itself and run under two users (one for desktop/indicator and the other
-for EC control), so you could see two processes in ps, and killing either one
-of them would immediately terminate the other.
-
-Be careful not to use any other program accessing the EC by low-level IO
-syscalls (inb/outb) at the same time - I don't know what might happen, since
-every EC actions require multiple commands to be issued in correct sequence and
-there is no kernel-level protection to ensure each action must be completed
-before other actions can be performed... The program also attempts to prevent
-abortion while issuing commands by catching all termination signals except
-SIGKILL - don't kill the indicator by "kill -9" unless absolutely necessary.
+Read [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the UI and worker design.
 
 ## Hacking
 
-To add more GUI menu options, edit the array around line ~138 in
-`clevo-indicator.c` and extend it as needed.
+Edit `control_rows[]` in [src/clevo-indicator.c](src/clevo-indicator.c) to change the CPU/GPU preset list exposed in the popup and legacy menus.
+
+Preset table:
 
 ```c
-static menuitems[] = {
-    {"Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL},
-    {"", NULL, 0L, NA, NULL},
-    {"Set FAN to  40%", G_CALLBACK(ui_command_set_fan), 40, MANUAL, NULL},
-    {"Set FAN to  50%", G_CALLBACK(ui_command_set_fan), 50, MANUAL, NULL},
-    {"Set FAN to  60%", G_CALLBACK(ui_command_set_fan), 60, MANUAL, NULL},
-    {"Set FAN to  70%", G_CALLBACK(ui_command_set_fan), 70, MANUAL, NULL},
-    {"Set FAN to  80%", G_CALLBACK(ui_command_set_fan), 80, MANUAL, NULL},
-    {"Set FAN to  90%", G_CALLBACK(ui_command_set_fan), 90, MANUAL, NULL},
-    {"Set FAN to 100%", G_CALLBACK(ui_command_set_fan), 100, MANUAL, NULL},
-    {"", NULL, 0L, NA, NULL},
-    {"Quit", G_CALLBACK(ui_command_quit), 0L, NA, NULL}};
+static FanControlRow control_rows[] = {
+    {"AUTO", 0, AUTO, NULL, NULL, NULL, NULL},
+    {"40%",  40, MANUAL, NULL, NULL, NULL, NULL},
+    {"50%",  50, MANUAL, NULL, NULL, NULL, NULL},
+    {"60%",  60, MANUAL, NULL, NULL, NULL, NULL},
+    {"70%",  70, MANUAL, NULL, NULL, NULL, NULL},
+    {"80%",  80, MANUAL, NULL, NULL, NULL, NULL},
+    {"90%",  90, MANUAL, NULL, NULL, NULL, NULL},
+    {"100%", 100, MANUAL, NULL, NULL, NULL, NULL},
+};
 ```
 
-Duty/auto-control rules are implemented in `clevo-indicator.c` around line ~884, for example:
-
-```c
-static int ec_auto_duty_adjust(void)
-{
-    int temp = MAX(share_info->cpu_temp, share_info->gpu_temp);
-    int duty = share_info->fan_duty;
-    //
-    if (temp >= 80 && duty < 100)
-        return 100;
-    // Additional logic omitted for brevity in this example.
-    //
-    return 0;
-}
-```
+Edit `ec_auto_duty_adjust()` in [src/clevo-indicator.c](src/clevo-indicator.c) to change the automatic duty curve.

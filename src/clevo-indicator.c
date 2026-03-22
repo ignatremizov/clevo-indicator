@@ -127,9 +127,18 @@ static void ui_sni_context_menu(int x, int y, void *user_data);
 static void ui_sni_secondary_activate(int x, int y, void *user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_fan_item_activated(GtkMenuItem *item, gpointer data);
+static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data);
 static GdkPixbuf *ui_draw_fan_icon(int size);
 static const char *ui_setup_icon_theme(void);
 static void ui_command_quit(gchar *command);
+static const char *ui_popup_row_class(int duty, MenuItemType type);
+static void ui_popup_init(void);
+static void ui_popup_show_at(int x, int y);
+static void ui_popup_hide(void);
+static gboolean ui_popup_focus_out(GtkWidget *widget, GdkEventFocus *event,
+                                   gpointer user_data);
+static gboolean ui_popup_key_press(GtkWidget *widget, GdkEventKey *event,
+                                   gpointer user_data);
 static void ui_toggle_menuitems(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
@@ -156,7 +165,9 @@ static void signal_term(__sighandler_t handler);
 
 static AppIndicator   *indicator_cpu    = NULL;  /* CPU fan control */
 static AppIndicator   *indicator_gpu    = NULL;  /* GPU fan control */
-static ClevoSni       *experimental_sni = NULL;  /* Opt-in native SNI scaffold */
+static ClevoSni       *experimental_sni = NULL;  /* Default native SNI path */
+static gboolean        ui_use_experimental_sni = FALSE;
+static GtkWidget      *fan_popup_window = NULL;
 static char ui_last_label[256] = "";
 #define MAX_FAN_ROWS 16
 
@@ -167,17 +178,19 @@ typedef struct
     MenuItemType type;
     GtkWidget *cpu_item;  /* GtkMenuItem in the CPU fan indicator menu */
     GtkWidget *gpu_item;  /* GtkMenuItem in the GPU fan indicator menu */
+    GtkWidget *cpu_btn;   /* GtkButton in the CPU popup column */
+    GtkWidget *gpu_btn;   /* GtkButton in the GPU popup column */
 } FanControlRow;
 
 static FanControlRow control_rows[] = {
-    {"AUTO", 0, AUTO,   NULL, NULL},
-    {"40%",  40, MANUAL, NULL, NULL},
-    {"50%",  50, MANUAL, NULL, NULL},
-    {"60%",  60, MANUAL, NULL, NULL},
-    {"70%",  70, MANUAL, NULL, NULL},
-    {"80%",  80, MANUAL, NULL, NULL},
-    {"90%",  90, MANUAL, NULL, NULL},
-    {"100%", 100, MANUAL, NULL, NULL},
+    {"AUTO", 0, AUTO,   NULL, NULL, NULL, NULL},
+    {"40%",  40, MANUAL, NULL, NULL, NULL, NULL},
+    {"50%",  50, MANUAL, NULL, NULL, NULL, NULL},
+    {"60%",  60, MANUAL, NULL, NULL, NULL, NULL},
+    {"70%",  70, MANUAL, NULL, NULL, NULL, NULL},
+    {"80%",  80, MANUAL, NULL, NULL, NULL, NULL},
+    {"90%",  90, MANUAL, NULL, NULL, NULL, NULL},
+    {"100%", 100, MANUAL, NULL, NULL, NULL, NULL},
 };
 
 static int control_rows_count = (sizeof(control_rows) / sizeof(control_rows[0]));
@@ -917,12 +930,16 @@ static const char *ui_setup_icon_theme(void)
 
 static void main_ui_worker(int argc, char **argv)
 {
+    gboolean force_legacy_appindicator = FALSE;
+
     printf("Indicator...\n");
     int desktop_uid = getuid();
     setuid(desktop_uid);
     gtk_init(&argc, &argv);
 
-    if (g_getenv("CLEVO_EXPERIMENTAL_SNI"))
+    force_legacy_appindicator = (g_getenv("CLEVO_LEGACY_APPINDICATOR") != NULL);
+
+    if (!force_legacy_appindicator)
     {
         ClevoSniHandlers handlers = {
             .activate = ui_sni_activate,
@@ -936,14 +953,29 @@ static void main_ui_worker(int argc, char **argv)
             clevo_sni_set_status(experimental_sni, "Active");
             clevo_sni_set_show_icon(experimental_sni, FALSE);
             clevo_sni_set_prefer_activate(experimental_sni, TRUE);
-            printf("experimental SNI enabled: %s%s\n",
+            printf("native SNI enabled: %s%s\n",
                    clevo_sni_get_bus_name(experimental_sni),
                    clevo_sni_get_object_path(experimental_sni));
         }
         else
         {
-            printf("experimental SNI init failed\n");
+            printf("native SNI init failed, falling back to legacy AppIndicator mode\n");
         }
+    }
+    else
+    {
+        printf("legacy AppIndicator mode forced via CLEVO_LEGACY_APPINDICATOR\n");
+    }
+
+    ui_use_experimental_sni = (experimental_sni != NULL);
+    if (ui_use_experimental_sni)
+    {
+        ui_popup_init();
+        g_timeout_add(500, &ui_update, NULL);
+        ui_toggle_menuitems();
+        gtk_main();
+        printf("main on UI quit\n");
+        return;
     }
 
     const char *fan_icon_theme = ui_setup_icon_theme();
@@ -1061,15 +1093,27 @@ static int main_test_gpu_fan(int duty_percentage)
 
 static gboolean ui_update(gpointer user_data)
 {
+    (void)user_data;
+
     int disp_cpu_duty = (share_info->manual_next_cpu_fan_duty != 0)
         ? share_info->manual_next_cpu_fan_duty : share_info->cpu_fan_duty;
     int disp_gpu_duty = (share_info->manual_next_gpu_fan_duty != 0)
         ? share_info->manual_next_gpu_fan_duty : share_info->gpu_fan_duty;
 
     char label[256];
-    snprintf(label, sizeof(label), "C:%d\xc2\xb0 %d%%  G:%d\xc2\xb0 %d%%",
-             share_info->cpu_temp, disp_cpu_duty,
-             share_info->gpu_temp, disp_gpu_duty);
+    if (ui_use_experimental_sni)
+    {
+        snprintf(label, sizeof(label),
+                 "\xf0\x9f\x8c\x80 C:%d\xc2\xb0 %d%%  G:%d\xc2\xb0 %d%% \xf0\x9f\x8c\x80",
+                 share_info->cpu_temp, disp_cpu_duty,
+                 share_info->gpu_temp, disp_gpu_duty);
+    }
+    else
+    {
+        snprintf(label, sizeof(label), "C:%d\xc2\xb0 %d%%  G:%d\xc2\xb0 %d%%",
+                 share_info->cpu_temp, disp_cpu_duty,
+                 share_info->gpu_temp, disp_gpu_duty);
+    }
 
     if (strcmp(ui_last_label, label) != 0)
     {
@@ -1078,7 +1122,7 @@ static gboolean ui_update(gpointer user_data)
         {
             clevo_sni_set_label(experimental_sni,
                                 label,
-                                "C:000\xc2\xb0 100%  G:000\xc2\xb0 100%");
+                                "\xf0\x9f\x8c\x80 C:000\xc2\xb0 100%  G:000\xc2\xb0 100% \xf0\x9f\x8c\x80");
         }
         if (indicator_cpu)
         {
@@ -1096,6 +1140,7 @@ static gboolean ui_update(gpointer user_data)
                                     "G:000\xc2\xb0 100% \xf0\x9f\x8c\x80");
         }
     }
+
     ui_toggle_menuitems();
     return G_SOURCE_CONTINUE;
 }
@@ -1158,6 +1203,13 @@ static void ui_fan_item_activated(GtkMenuItem *item, gpointer data)
     ui_command_set_fan((long)GPOINTER_TO_INT(data));
 }
 
+static void ui_fan_btn_clicked(GtkWidget *btn, gpointer data)
+{
+    (void)btn;
+    ui_popup_hide();
+    ui_command_set_fan((long)GPOINTER_TO_INT(data));
+}
+
 static void ui_command_quit(gchar *command)
 {
     (void)command;
@@ -1170,22 +1222,322 @@ static void ui_command_quit(gchar *command)
     gtk_main_quit();
 }
 
+static const char *ui_popup_row_class(int duty, MenuItemType type)
+{
+    if (type == AUTO)
+        return "fan-auto";
+
+    switch (duty)
+    {
+    case 40:  return "fan-duty-40";
+    case 50:  return "fan-duty-50";
+    case 60:  return "fan-duty-60";
+    case 70:  return "fan-duty-70";
+    case 80:  return "fan-duty-80";
+    case 90:  return "fan-duty-90";
+    case 100: return "fan-duty-100";
+    default:  return "fan-auto";
+    }
+}
+
+static void ui_popup_init(void)
+{
+    if (fan_popup_window)
+        return;
+
+    fan_popup_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_decorated(GTK_WINDOW(fan_popup_window), FALSE);
+    gtk_window_set_skip_taskbar_hint(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_skip_pager_hint(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_keep_above(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_accept_focus(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_focus_on_map(GTK_WINDOW(fan_popup_window), TRUE);
+    gtk_window_set_type_hint(GTK_WINDOW(fan_popup_window),
+                             GDK_WINDOW_TYPE_HINT_POPUP_MENU);
+    gtk_window_set_resizable(GTK_WINDOW(fan_popup_window), FALSE);
+    gtk_container_set_border_width(GTK_CONTAINER(fan_popup_window), 0);
+    g_signal_connect(fan_popup_window, "focus-out-event",
+                     G_CALLBACK(ui_popup_focus_out), NULL);
+    g_signal_connect(fan_popup_window, "key-press-event",
+                     G_CALLBACK(ui_popup_key_press), NULL);
+
+    GtkCssProvider *popup_css = gtk_css_provider_new();
+    gtk_css_provider_load_from_data(
+        popup_css,
+        "window.clevo-popup button.fan-choice {"
+        "  background-image: none;"
+        "  color: #3c4149;"
+        "  border-radius: 0;"
+        "  border: 1px solid transparent;"
+        "  box-shadow: none;"
+        "  padding: 6px 10px;"
+        "  margin: 0;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-auto {"
+        "  background-color: #f4f6f8;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-40 {"
+        "  background-color: #e4f4de;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-50 {"
+        "  background-color: #ebf4d7;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-60 {"
+        "  background-color: #f2f0cf;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-70 {"
+        "  background-color: #f7e7c8;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-80 {"
+        "  background-color: #f7d7bc;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-90 {"
+        "  background-color: #f4c4b5;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-duty-100 {"
+        "  background-color: #efb2b2;"
+        "}"
+        "window.clevo-popup button.fan-choice:hover {"
+        "  border-color: rgba(69, 83, 108, 0.22);"
+        "  box-shadow: inset 0 0 0 1px rgba(69, 83, 108, 0.12);"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-selected {"
+        "  color: #24303d;"
+        "}"
+        "window.clevo-popup button.fan-choice label {"
+        "  font-weight: 500;"
+        "}"
+        "window.clevo-popup button.fan-choice.fan-selected label {"
+        "  font-weight: 700;"
+        "}",
+        -1, NULL);
+    gtk_style_context_add_provider_for_screen(
+        gdk_screen_get_default(),
+        GTK_STYLE_PROVIDER(popup_css),
+        GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
+    g_object_unref(popup_css);
+    gtk_style_context_add_class(gtk_widget_get_style_context(fan_popup_window),
+                                "clevo-popup");
+
+    GtkWidget *frame = gtk_frame_new(NULL);
+    gtk_frame_set_shadow_type(GTK_FRAME(frame), GTK_SHADOW_ETCHED_OUT);
+    gtk_container_add(GTK_CONTAINER(fan_popup_window), frame);
+
+    GtkWidget *outer_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
+    gtk_container_set_border_width(GTK_CONTAINER(outer_box), 6);
+    gtk_container_add(GTK_CONTAINER(frame), outer_box);
+
+    GtkWidget *grid = gtk_grid_new();
+    gtk_grid_set_column_spacing(GTK_GRID(grid), 4);
+    gtk_grid_set_row_spacing(GTK_GRID(grid), 0);
+    gtk_box_pack_start(GTK_BOX(outer_box), grid, TRUE, TRUE, 0);
+
+    GtkWidget *cpu_hdr = gtk_label_new(NULL);
+    GtkWidget *gpu_hdr = gtk_label_new(NULL);
+    gtk_label_set_markup(GTK_LABEL(cpu_hdr), "<b>CPU</b>");
+    gtk_label_set_markup(GTK_LABEL(gpu_hdr), "<b>GPU</b>");
+    gtk_widget_set_hexpand(cpu_hdr, TRUE);
+    gtk_widget_set_hexpand(gpu_hdr, TRUE);
+    gtk_grid_attach(GTK_GRID(grid), cpu_hdr, 0, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    gtk_separator_new(GTK_ORIENTATION_VERTICAL),
+                    1, 0, 1, control_rows_count + 2);
+    gtk_grid_attach(GTK_GRID(grid), gpu_hdr, 2, 0, 1, 1);
+    gtk_grid_attach(GTK_GRID(grid),
+                    gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                    0, 1, 3, 1);
+
+    for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
+    {
+        GtkWidget *cpu_btn = gtk_button_new_with_label(control_rows[i].label);
+        GtkWidget *gpu_btn = gtk_button_new_with_label(control_rows[i].label);
+
+        gtk_button_set_relief(GTK_BUTTON(cpu_btn), GTK_RELIEF_NORMAL);
+        gtk_button_set_relief(GTK_BUTTON(gpu_btn), GTK_RELIEF_NORMAL);
+        gtk_widget_set_hexpand(cpu_btn, TRUE);
+        gtk_widget_set_hexpand(gpu_btn, TRUE);
+        gtk_style_context_add_class(gtk_widget_get_style_context(cpu_btn),
+                                    "fan-choice");
+        gtk_style_context_add_class(gtk_widget_get_style_context(gpu_btn),
+                                    "fan-choice");
+        gtk_style_context_add_class(gtk_widget_get_style_context(cpu_btn),
+                                    ui_popup_row_class(control_rows[i].duty,
+                                                       control_rows[i].type));
+        gtk_style_context_add_class(gtk_widget_get_style_context(gpu_btn),
+                                    ui_popup_row_class(control_rows[i].duty,
+                                                       control_rows[i].type));
+
+        g_signal_connect(cpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
+                         GINT_TO_POINTER(FAN_COMMAND(FAN_CPU, control_rows[i].duty)));
+        g_signal_connect(gpu_btn, "clicked", G_CALLBACK(ui_fan_btn_clicked),
+                         GINT_TO_POINTER(FAN_COMMAND(FAN_GPU, control_rows[i].duty)));
+
+        gtk_grid_attach(GTK_GRID(grid), cpu_btn, 0, i + 2, 1, 1);
+        gtk_grid_attach(GTK_GRID(grid), gpu_btn, 2, i + 2, 1, 1);
+
+        control_rows[i].cpu_btn = cpu_btn;
+        control_rows[i].gpu_btn = gpu_btn;
+    }
+
+    gtk_box_pack_start(GTK_BOX(outer_box),
+                       gtk_separator_new(GTK_ORIENTATION_HORIZONTAL),
+                       FALSE, FALSE, 0);
+
+    GtkWidget *quit_btn = gtk_button_new_with_label("Quit");
+    gtk_widget_set_size_request(quit_btn, -1, 30);
+    g_signal_connect_swapped(quit_btn, "clicked", G_CALLBACK(ui_command_quit), NULL);
+    gtk_box_pack_start(GTK_BOX(outer_box), quit_btn, FALSE, FALSE, 0);
+}
+
+static void ui_popup_show_at(int x, int y)
+{
+    char *startup_token = NULL;
+
+    if (!fan_popup_window)
+        return;
+
+    if (experimental_sni)
+        startup_token = clevo_sni_take_activation_token(experimental_sni);
+
+    if (gtk_widget_is_visible(fan_popup_window))
+    {
+        ui_popup_hide();
+        if (startup_token && startup_token[0] != '\0')
+            gdk_notify_startup_complete_with_id(startup_token);
+        g_free(startup_token);
+        return;
+    }
+
+    {
+        GdkDisplay *display = gdk_display_get_default();
+        GdkSeat *seat = display ? gdk_display_get_default_seat(display) : NULL;
+        GdkDevice *pointer = seat ? gdk_seat_get_pointer(seat) : NULL;
+        if (pointer)
+            gdk_device_get_position(pointer, NULL, &x, &y);
+        else if (x < 0 || y < 0)
+        {
+            x = 0;
+            y = 0;
+        }
+    }
+
+    GtkRequisition natural = {0};
+    gtk_widget_get_preferred_size(fan_popup_window, NULL, &natural);
+    int width = natural.width > 0 ? natural.width : 320;
+    int height = natural.height > 0 ? natural.height : 320;
+    int px = x - (width / 2);
+    int py = y + 8;
+
+    GdkDisplay *display = gdk_display_get_default();
+    GdkMonitor *monitor = NULL;
+    if (display)
+        monitor = gdk_display_get_monitor_at_point(display, x, y);
+    if (!monitor && display)
+        monitor = gdk_display_get_primary_monitor(display);
+    if (monitor)
+    {
+        GdkRectangle workarea;
+        gdk_monitor_get_workarea(monitor, &workarea);
+        if (px < workarea.x)
+            px = workarea.x;
+        if (py < workarea.y)
+            py = workarea.y;
+        if (px + width > workarea.x + workarea.width)
+            px = ((workarea.width > width)
+                ? (workarea.x + workarea.width - width)
+                : workarea.x);
+        if (py + height > workarea.y + workarea.height)
+            py = ((workarea.height > height)
+                ? (workarea.y + workarea.height - height)
+                : workarea.y);
+    }
+
+    ui_toggle_menuitems();
+    if (startup_token && startup_token[0] != '\0')
+        gtk_window_set_startup_id(GTK_WINDOW(fan_popup_window), startup_token);
+    gtk_window_move(GTK_WINDOW(fan_popup_window), px, py);
+    gtk_widget_show_all(fan_popup_window);
+    gtk_window_present_with_time(GTK_WINDOW(fan_popup_window), GDK_CURRENT_TIME);
+
+    GdkWindow *gdk_win = gtk_widget_get_window(fan_popup_window);
+    if (gdk_win)
+        gdk_window_move(gdk_win, px, py);
+
+    if (control_rows_count > 0 && control_rows[0].cpu_btn)
+        gtk_widget_grab_focus(control_rows[0].cpu_btn);
+
+    if (startup_token && startup_token[0] != '\0')
+    {
+        gdk_notify_startup_complete_with_id(startup_token);
+        g_free(startup_token);
+    }
+    else
+    {
+        g_free(startup_token);
+    }
+}
+
+static void ui_popup_hide(void)
+{
+    if (fan_popup_window)
+        gtk_widget_hide(fan_popup_window);
+}
+
+static gboolean ui_popup_focus_out(GtkWidget *widget, GdkEventFocus *event,
+                                   gpointer user_data)
+{
+    (void)event;
+    (void)user_data;
+
+    if (widget)
+    {
+        GdkDisplay *display = gdk_display_get_default();
+        GdkSeat *seat = display ? gdk_display_get_default_seat(display) : NULL;
+        GdkDevice *pointer = seat ? gdk_seat_get_pointer(seat) : NULL;
+        GdkWindow *window = gtk_widget_get_window(widget);
+        GdkModifierType mask = 0;
+
+        if (pointer && window)
+            gdk_device_get_state(pointer, window, NULL, &mask);
+
+        if (mask & (GDK_BUTTON1_MASK | GDK_BUTTON2_MASK | GDK_BUTTON3_MASK))
+            ui_popup_hide();
+    }
+
+    return FALSE;
+}
+
+static gboolean ui_popup_key_press(GtkWidget *widget, GdkEventKey *event,
+                                   gpointer user_data)
+{
+    (void)widget;
+    (void)user_data;
+
+    if (event->keyval == GDK_KEY_Escape)
+    {
+        ui_popup_hide();
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
 static void ui_sni_activate(int x, int y, void *user_data)
 {
     (void)user_data;
-    printf("SNI activate at %d,%d (custom popup hook not wired yet)\n", x, y);
+    ui_popup_show_at(x, y);
 }
 
 static void ui_sni_context_menu(int x, int y, void *user_data)
 {
     (void)user_data;
-    printf("SNI context menu at %d,%d\n", x, y);
+    ui_popup_show_at(x, y);
 }
 
 static void ui_sni_secondary_activate(int x, int y, void *user_data)
 {
     (void)user_data;
-    printf("SNI secondary activate at %d,%d\n", x, y);
+    ui_popup_show_at(x, y);
 }
 
 /* Draw a 3-blade propeller fan icon into a size×size ARGB pixbuf. */
@@ -1230,9 +1582,6 @@ static GdkPixbuf *ui_draw_fan_icon(int size)
 
 static void ui_toggle_menuitems(void)
 {
-    if (!indicator_cpu || !indicator_gpu)
-        return;
-
     int is_cpu_auto  = share_info->auto_cpu_duty;
     int is_gpu_auto  = share_info->auto_gpu_duty;
     int pending_cpu  = share_info->manual_next_cpu_fan_duty;
@@ -1244,9 +1593,6 @@ static void ui_toggle_menuitems(void)
 
     for (int i = 0; i < control_rows_count && i < MAX_FAN_ROWS; i++)
     {
-        if (!control_rows[i].cpu_item || !control_rows[i].gpu_item)
-            continue;
-
         int sel_cpu = (control_rows[i].type == AUTO)
             ? is_cpu_auto
             : (!is_cpu_auto && control_rows[i].duty == cpu_sel_duty);
@@ -1260,8 +1606,34 @@ static void ui_toggle_menuitems(void)
         snprintf(gpu_text, sizeof(gpu_text), "%s %s",
                  sel_gpu ? "\xe2\x80\xa2" : " ", control_rows[i].label);
 
-        gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].cpu_item), cpu_text);
-        gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].gpu_item), gpu_text);
+        if (control_rows[i].cpu_item)
+            gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].cpu_item), cpu_text);
+        if (control_rows[i].gpu_item)
+            gtk_menu_item_set_label(GTK_MENU_ITEM(control_rows[i].gpu_item), gpu_text);
+        if (control_rows[i].cpu_btn)
+        {
+            gtk_button_set_label(GTK_BUTTON(control_rows[i].cpu_btn), cpu_text);
+            if (sel_cpu)
+                gtk_style_context_add_class(
+                    gtk_widget_get_style_context(control_rows[i].cpu_btn),
+                    "fan-selected");
+            else
+                gtk_style_context_remove_class(
+                    gtk_widget_get_style_context(control_rows[i].cpu_btn),
+                    "fan-selected");
+        }
+        if (control_rows[i].gpu_btn)
+        {
+            gtk_button_set_label(GTK_BUTTON(control_rows[i].gpu_btn), gpu_text);
+            if (sel_gpu)
+                gtk_style_context_add_class(
+                    gtk_widget_get_style_context(control_rows[i].gpu_btn),
+                    "fan-selected");
+            else
+                gtk_style_context_remove_class(
+                    gtk_widget_get_style_context(control_rows[i].gpu_btn),
+                    "fan-selected");
+        }
     }
 }
 

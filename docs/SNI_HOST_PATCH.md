@@ -26,7 +26,7 @@ Primary fork for this work:
 - GitHub: `git@github.com:ignatremizov/gnome-shell-extension-appindicator.git`
 - Local clone: `~/code/gnome-shell-extension-appindicator`
 - Local installed extension UUID/path:
-  `~/.local/share/gnome-shell/extensions/appindicatorsupport@rgcjonas.gmail.com`
+  `~/.local/share/gnome-shell/extensions/appindicatorsupport@ignatremizov.com`
 
 The Ubuntu-packaged extension remains useful as a reference when comparing the
 stock behavior:
@@ -83,13 +83,20 @@ the host patch is only changing click routing and actor layout.
 
 ## Current repo integration
 
-`CLEVO_EXPERIMENTAL_SNI=1` enables the native SNI scaffold without changing the
-default AppIndicator runtime path. The current scaffold:
+The native SNI path is now the default GUI mode in this repo.
 
-- exports label updates
+Current behavior:
+
+- exports a native `StatusNotifierItem` from `src/sni.c`
+- exports label updates through `XAyatanaLabel`
 - exports `XClevoShowIcon=false`
 - exports `XClevoPreferActivate=true`
-- logs `Activate` / `ContextMenu` / `SecondaryActivate` calls
+- consumes `ProvideXdgActivationToken(...)` from GNOME Shell
+- opens an app-owned `GtkWindow` popup on `Activate(x, y)`
+- renders a dual-column CPU/GPU fan control grid in that popup
 
-The custom popup window is not wired yet; that becomes the next app-side step
-once the host extension is patched to route primary click via `Activate`.
+The old dual-AppIndicator UI is still available as an explicit fallback:
+
+```bash
+CLEVO_LEGACY_APPINDICATOR=1 /usr/local/bin/clevo-indicator indicator
+```
