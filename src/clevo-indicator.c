@@ -50,6 +50,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #include <pthread.h>
 
@@ -142,7 +143,8 @@ static gboolean ui_popup_key_press(GtkWidget *widget, GdkEventKey *event,
 static void ui_toggle_menuitems(void);
 static void ec_on_sigterm(int signum);
 static int ec_init(void);
-static int ec_auto_duty_adjust(int temp, int current_duty);
+static int ec_auto_duty_adjust(FanIndex fan, int temp, int current_duty);
+static void ec_reset_auto_duty_state(FanIndex fan);
 static int ec_query_cpu_temp(void);
 static int ec_query_gpu_temp(void);
 static int ec_query_gpu_temp_nvidia(void);
@@ -194,6 +196,43 @@ static FanControlRow control_rows[] = {
 };
 
 static int control_rows_count = (sizeof(control_rows) / sizeof(control_rows[0]));
+
+typedef struct
+{
+    int temp;
+    int duty;
+} AutoFanCurvePoint;
+
+typedef struct
+{
+    int initialized;
+    int last_applied_duty;
+    int last_temp;
+    struct timespec last_change_at;
+} AutoFanState;
+
+static AutoFanState auto_fan_states[2] = {0};
+
+#define AUTO_FAN_EMERGENCY_TEMP_C 90
+#define AUTO_FAN_MIN_ADJUST_MS 3000
+#define AUTO_FAN_MIN_DUTY_DELTA 3
+#define AUTO_FAN_UP_HYSTERESIS_C 2
+#define AUTO_FAN_DOWN_HYSTERESIS_C 3
+
+/* Piecewise-linear shared fan curve. Both fans follow the hotter of CPU/GPU
+   because the Clevo chassis and cooling path are thermally coupled. */
+static const AutoFanCurvePoint auto_fan_curve[] = {
+    {15, 30},
+    {50, 42},
+    {60, 52},
+    {68, 62},
+    {75, 74},
+    {82, 88},
+    {88, 100},
+};
+
+static int auto_fan_curve_count =
+    (sizeof(auto_fan_curve) / sizeof(auto_fan_curve[0]));
 
 struct
 {
@@ -749,6 +788,8 @@ static int main_ec_worker(void)
         exit(EXIT_FAILURE);
     }
     int initialized = 0;
+    int prev_auto_cpu_duty = -1;
+    int prev_auto_gpu_duty = -1;
     while (share_info->exit == 0)
     {
         // check parent
@@ -821,12 +862,23 @@ static int main_ec_worker(void)
         default:
             printf("wrong EC size from sysfs: %ld\n", len);
         }
-        // auto EC
+        if (share_info->auto_cpu_duty != prev_auto_cpu_duty)
+        {
+            ec_reset_auto_duty_state(FAN_CPU);
+            prev_auto_cpu_duty = share_info->auto_cpu_duty;
+        }
+        if (share_info->auto_gpu_duty != prev_auto_gpu_duty)
+        {
+            ec_reset_auto_duty_state(FAN_GPU);
+            prev_auto_gpu_duty = share_info->auto_gpu_duty;
+        }
+        // Auto mode uses the hotter of CPU/GPU because this Clevo's shared
+        // heatsink/chassis means either hotspot raises the whole thermal load.
         int target_temp = MAX(share_info->cpu_temp, share_info->gpu_temp);
         if (share_info->auto_cpu_duty == 1)
         {
             int next_duty =
-                ec_auto_duty_adjust(target_temp, share_info->cpu_fan_duty);
+                ec_auto_duty_adjust(FAN_CPU, target_temp, share_info->cpu_fan_duty);
             if (next_duty != 0 &&
                 next_duty != share_info->auto_cpu_duty_val)
             {
@@ -841,7 +893,7 @@ static int main_ec_worker(void)
         if (share_info->auto_gpu_duty == 1)
         {
             int next_duty =
-                ec_auto_duty_adjust(target_temp, share_info->gpu_fan_duty);
+                ec_auto_duty_adjust(FAN_GPU, target_temp, share_info->gpu_fan_duty);
             if (next_duty != 0 &&
                 next_duty != share_info->auto_gpu_duty_val)
             {
@@ -1653,48 +1705,118 @@ static void ec_on_sigterm(int signum)
         share_info->exit = 1;
 }
 
-static int ec_auto_duty_adjust(int temp, int duty)
+/* Interpolate between neighboring anchor points in auto_fan_curve[]. */
+static int ec_auto_curve_target_duty(int temp)
 {
-    int new_duty = duty;
-    //
-    if (temp >= 80 && duty < 100)
-        new_duty = 100;
-    else if (temp >= 70 && duty < 90)
-        new_duty = 90;
-    else if (temp >= 60 && duty < 80)
-        new_duty = 80;
-    else if (temp >= 50 && duty < 70)
-        new_duty = 70;
-    else if (temp >= 40 && duty < 60)
-        new_duty = 60;
-    else if (temp >= 30 && duty < 50)
-        new_duty = 50;
-    else if (temp >= 20 && duty < 40)
-        new_duty = 40;
-    else if (temp >= 10 && duty < 30)
-        new_duty = 30;
-    //
-    else if (temp <= 15 && duty > 30)
-        new_duty = 30;
-    else if (temp <= 25 && duty > 40)
-        new_duty = 40;
-    else if (temp <= 35 && duty > 50)
-        new_duty = 50;
-    else if (temp <= 45 && duty > 60)
-        new_duty = 60;
-    else if (temp <= 55 && duty > 70)
-        new_duty = 70;
-    else if (temp <= 65 && duty > 80)
-        new_duty = 80;
-    else if (temp <= 75 && duty > 90)
-        new_duty = 90;
-    else
+    if (temp <= auto_fan_curve[0].temp)
+        return auto_fan_curve[0].duty;
+
+    for (int i = 1; i < auto_fan_curve_count; i++)
+    {
+        AutoFanCurvePoint low = auto_fan_curve[i - 1];
+        AutoFanCurvePoint high = auto_fan_curve[i];
+        if (temp <= high.temp)
+        {
+            int temp_span = high.temp - low.temp;
+            int duty_span = high.duty - low.duty;
+            return low.duty +
+                   (temp - low.temp) * duty_span / temp_span;
+        }
+    }
+
+    return auto_fan_curve[auto_fan_curve_count - 1].duty;
+}
+
+static long ec_elapsed_ms_since(const struct timespec *start,
+                                const struct timespec *end)
+{
+    return (end->tv_sec - start->tv_sec) * 1000L +
+           (end->tv_nsec - start->tv_nsec) / 1000000L;
+}
+
+static AutoFanState *ec_auto_fan_state(FanIndex fan)
+{
+    switch (fan)
+    {
+    case FAN_CPU:
+        return &auto_fan_states[0];
+    case FAN_GPU:
+        return &auto_fan_states[1];
+    default:
+        return NULL;
+    }
+}
+
+/* Clear per-fan smoothing state when the worker sees an auto/manual mode flip. */
+static void ec_reset_auto_duty_state(FanIndex fan)
+{
+    AutoFanState *state = ec_auto_fan_state(fan);
+    if (state == NULL)
+        return;
+
+    memset(state, 0, sizeof(*state));
+}
+
+/* Auto control applies the shared curve against the live EC duty, with
+   hysteresis/rate limiting for normal adjustments but immediate correction on
+   first entry to AUTO, emergency temperatures, or controller re-sync. */
+static int ec_auto_duty_adjust(FanIndex fan, int temp, int current_duty)
+{
+    AutoFanState *state = ec_auto_fan_state(fan);
+    if (state == NULL)
         return 0;
 
-    if (new_duty == duty)
+    int first_adjustment = !state->initialized;
+    if (!state->initialized)
+    {
+        state->initialized = 1;
+        state->last_applied_duty = current_duty;
+        state->last_temp = temp;
+        clock_gettime(CLOCK_MONOTONIC, &state->last_change_at);
+    }
+
+    if (temp >= AUTO_FAN_EMERGENCY_TEMP_C)
+    {
+        if (current_duty >= 100)
+            return 0;
+        state->last_applied_duty = 100;
+        state->last_temp = temp;
+        clock_gettime(CLOCK_MONOTONIC, &state->last_change_at);
+        return 100;
+    }
+
+    int target_duty = ec_auto_curve_target_duty(temp);
+    int current_auto_duty = current_duty;
+    int duty_delta = target_duty - current_auto_duty;
+    int controller_desynced =
+        abs(current_duty - state->last_applied_duty) >= AUTO_FAN_MIN_DUTY_DELTA;
+    if (abs(duty_delta) < AUTO_FAN_MIN_DUTY_DELTA)
+    {
+        state->last_applied_duty = current_duty;
         return 0;
-    return new_duty;
-    //
+    }
+
+    if (!first_adjustment && !controller_desynced)
+    {
+        /* Temperature hysteresis keeps the controller from chasing 1-2C noise
+           when the fan is already near the requested operating point. */
+        if (duty_delta > 0 && temp < state->last_temp + AUTO_FAN_UP_HYSTERESIS_C)
+            return 0;
+        if (duty_delta < 0 && temp > state->last_temp - AUTO_FAN_DOWN_HYSTERESIS_C)
+            return 0;
+    }
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed_ms = ec_elapsed_ms_since(&state->last_change_at, &now);
+    if (!first_adjustment && !controller_desynced &&
+        elapsed_ms < AUTO_FAN_MIN_ADJUST_MS && abs(duty_delta) < 10)
+        return 0;
+
+    state->last_applied_duty = target_duty;
+    state->last_temp = temp;
+    state->last_change_at = now;
+    return target_duty;
 }
 
 static int ec_query_cpu_temp(void)
