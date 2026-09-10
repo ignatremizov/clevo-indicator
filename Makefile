@@ -8,7 +8,7 @@ DSTDIR := /usr/local
 OBJDIR := obj
 SRCDIR := src
 
-SRC = clevo-indicator.c sni.c
+SRC = clevo-indicator.c sni.c ec-monitor.c
 OBJ = $(patsubst %.c,$(OBJDIR)/%.o,$(SRC)) 
 
 TARGET = bin/clevo-indicator
@@ -41,6 +41,8 @@ $(OBJDIR)/%.o : $(SRCDIR)/%.c Makefile
 	@echo compiling $< 
 	@mkdir -p obj
 	@$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/clevo-indicator.o $(OBJDIR)/ec-monitor.o: src/ec-monitor.h
 
 #$(OBJECTS): | obj
 

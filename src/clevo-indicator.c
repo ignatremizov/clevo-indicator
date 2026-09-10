@@ -59,6 +59,7 @@
 #include <libayatana-appindicator/app-indicator.h>
 
 #include "sni.h"
+#include "ec-monitor.h"
 
 #define NAME "clevo-indicator"
 
@@ -813,35 +814,27 @@ static int main_ec_worker(void)
             ec_write_gpu_fan_duty(new_gpu_fan_duty);
             share_info->manual_prev_gpu_fan_duty = new_gpu_fan_duty;
         }
-        // read EC — lseek resets position directly on the fd without stdio buffering issues
-        lseek(ec_fd, 0, SEEK_SET);
-        unsigned char buf[EC_REG_SIZE];
-        ssize_t len = read(ec_fd, buf, EC_REG_SIZE);
-        switch (len)
+        EcSample sample;
+        if (ec_sample_read(ec_fd, pread, &sample) != 0)
         {
-        case -1:
-            printf("unable to read EC sysfs: %s\n", strerror(errno));
-            break;
-        case 0x100:
-            share_info->cpu_temp = buf[EC_REG_CPU_TEMP];
+            printf("unable to read EC sample: %s\n", strerror(errno));
+        }
+        else
+        {
+            share_info->cpu_temp = sample.cpu_temp;
             if (use_gpu_temp_smi)
             {
                 int smi_temp = g_gpu_temp_smi;
-                if (smi_temp > 0)
-                    share_info->gpu_temp = smi_temp;
-                else
-                    share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+                share_info->gpu_temp = smi_temp > 0 ? smi_temp : sample.gpu_temp;
             }
             else
             {
-                share_info->gpu_temp = buf[EC_REG_GPU_TEMP];
+                share_info->gpu_temp = sample.gpu_temp;
             }
-            share_info->cpu_fan_duty = calculate_fan_duty(buf[EC_REG_CPU_FAN_DUTY]);
-            share_info->gpu_fan_duty = calculate_fan_duty(buf[EC_REG_GPU_FAN_DUTY]);
-            share_info->cpu_fan_rpms = calculate_fan_rpms(
-                buf[EC_REG_CPU_FAN_RPMS_HI], buf[EC_REG_CPU_FAN_RPMS_LO]);
-            share_info->gpu_fan_rpms = calculate_fan_rpms(
-                buf[EC_REG_GPU_FAN_RPMS_HI], buf[EC_REG_GPU_FAN_RPMS_LO]);
+            share_info->cpu_fan_duty = calculate_fan_duty(sample.cpu_duty);
+            share_info->gpu_fan_duty = calculate_fan_duty(sample.gpu_duty);
+            share_info->cpu_fan_rpms = calculate_fan_rpms(sample.rpm[0], sample.rpm[1]);
+            share_info->gpu_fan_rpms = calculate_fan_rpms(sample.rpm[2], sample.rpm[3]);
             if (!initialized)
             {
                 share_info->manual_prev_cpu_fan_duty = share_info->cpu_fan_duty;
@@ -852,15 +845,6 @@ static int main_ec_worker(void)
                 share_info->auto_gpu_duty = 0;
                 initialized = 1;
             }
-            /*
-             printf("temp=%d, cpu_duty=%d, cpu_rpms=%d, gpu_duty=%d, gpu_rpms=%d\n",
-             share_info->cpu_temp, share_info->cpu_fan_duty,
-             share_info->cpu_fan_rpms, share_info->gpu_fan_duty,
-             share_info->gpu_fan_rpms);
-             */
-            break;
-        default:
-            printf("wrong EC size from sysfs: %ld\n", len);
         }
         if (share_info->auto_cpu_duty != prev_auto_cpu_duty)
         {
