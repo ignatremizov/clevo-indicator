@@ -36,6 +36,16 @@ They communicate through one shared anonymous `mmap` page (`share_info`), which 
 - pending manual duty requests
 - the last duty values applied by the worker
 
+### EC Sampling And Command Confirmation
+
+`src/ec-monitor.c` provides the positional EC sampler, temperature freshness helpers, bounded GPU subprocess query, and per-fan retry/readback tracking. The worker samples `0x07` and `0xCD–0xD3`, publishing the eight relevant bytes only after both reads complete. The 200 ms post-cycle sleep remains unchanged. The full-register dump is reserved for the explicit `dumpall` command.
+
+CPU/EC GPU readings expire after three seconds without a successful sample. The NVIDIA thread publishes a mutex-protected value and monotonic timestamp; failed queries invalidate that cache, and stale data falls back to the EC. Unavailable sensors are represented as `-1`. Sensor loss requests 100% only for AUTO-selected fans; recovery resets smoothing state and resumes the existing curve. Manual selections remain in force.
+
+Each fan tracks a desired target, last-attempt time, and readback confirmation. Writing successfully does not establish that the fan has adopted the target. Fresh EC duty readback confirms it; a mismatch remains eligible for a rate-limited retry, including an unchanged emergency target. Mode changes discard the previous desired target but retain retry timing. A new 100% target may bypass the ordinary two-second delay.
+
+Tests include the actual worker translation unit with port I/O and relevant system calls replaced, so control-loop regressions can be exercised without root or hardware. See the README for `make check`, fault-policy details, and the separate live-deployment validation procedure.
+
 The default UI path now starts by creating a native `StatusNotifierItem` in `src/sni.c`. If that succeeds, the GTK process uses a single combined indicator plus a custom popup window. If native SNI initialization fails, or if `CLEVO_LEGACY_APPINDICATOR=1` is set, the UI falls back to the older dual-`AppIndicator` layout.
 
 ## UI architecture
