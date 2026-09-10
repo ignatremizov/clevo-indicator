@@ -102,7 +102,7 @@ int hwmon_interface_num = 0;
 static int use_gpu_temp_smi = 1;
 static int monitor_fan_rpm = 0;
 
-static void main_init_share(void);
+static int main_init_share(void);
 static int main_ec_worker(void);
 static void main_ui_worker(int argc, char **argv);
 static void main_on_sigchld(int signum);
@@ -583,7 +583,8 @@ int main(int argc, char *argv[])
         else
         {
             parent_pid = getpid();
-            main_init_share();
+            if (main_init_share() != EXIT_SUCCESS)
+                return EXIT_FAILURE;
             signal(SIGCHLD, &main_on_sigchld);
             signal_term(&main_on_sigterm);
             sigset_t child_mask, previous_mask;
@@ -736,10 +737,14 @@ int main(int argc, char *argv[])
     return EXIT_SUCCESS;
 }
 
-static void main_init_share(void)
+static int main_init_share(void)
 {
     void *shm = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED,
                      -1, 0);
+    if (shm == MAP_FAILED) {
+        fprintf(stderr, "unable to allocate shared state: %s\n", strerror(errno));
+        return EXIT_FAILURE;
+    }
     share_info = shm;
     share_info->exit = 0;
     share_info->cpu_temp = 0;
@@ -756,6 +761,7 @@ static void main_init_share(void)
     share_info->manual_next_gpu_fan_duty = 0;
     share_info->manual_prev_cpu_fan_duty = 0;
     share_info->manual_prev_gpu_fan_duty = 0;
+    return EXIT_SUCCESS;
 }
 
 static EcTemperature g_gpu_temperature;

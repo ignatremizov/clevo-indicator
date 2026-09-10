@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/io.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "../src/ec-monitor.h"
 
@@ -25,6 +26,7 @@ static unsigned char test_inb(unsigned short port);
 static void test_outb(unsigned char value, unsigned short port);
 static int64_t test_now(void);
 static int test_coretemp(const char *root);
+static void *test_mmap(void *, size_t, int, int, int, off_t);
 
 #define main unused_indicator_main
 #define setuid test_setuid
@@ -37,6 +39,7 @@ static int test_coretemp(const char *root);
 #define outb test_outb
 #define ec_monotonic_ms test_now
 #define ec_coretemp_read test_coretemp
+#define mmap test_mmap
 #include "../src/clevo-indicator.c"
 #undef main
 #undef setuid
@@ -49,6 +52,7 @@ static int test_coretemp(const char *root);
 #undef outb
 #undef ec_monotonic_ms
 #undef ec_coretemp_read
+#undef mmap
 
 static __typeof__(*share_info) shared;
 static int loops, limit, fail_sample_after, bytes_read, write_count;
@@ -58,6 +62,20 @@ static unsigned char cpu_temperature, gpu_temperature, cpu_duty, gpu_duty;
 static unsigned char written[512];
 static int native_cpu, native_gpu, rpm_bytes, duty_bytes, duty_drift, fail_rpm;
 static int lose_native_cpu;
+static int fail_mmap;
+
+static void *test_mmap(void *addr, size_t length, int prot, int flags,
+                       int fd, off_t offset)
+{
+    assert(!addr && length == 4096 && fd == -1 && offset == 0);
+    assert(prot == (PROT_READ | PROT_WRITE));
+    assert(flags == (MAP_ANON | MAP_SHARED));
+    if (fail_mmap) {
+        errno = ENOMEM;
+        return MAP_FAILED;
+    }
+    return &shared;
+}
 
 static void reset_worker(int iterations)
 {
@@ -369,6 +387,13 @@ static void test_worker_cases(void)
 
 int main(void)
 {
+    share_info = NULL;
+    fail_mmap = 1;
+    assert(main_init_share() == EXIT_FAILURE && share_info == NULL);
+    fail_mmap = 0;
+    assert(main_init_share() == EXIT_SUCCESS && share_info == &shared);
+    assert(shared.exit == 0 && shared.cpu_fan_rpms == -1);
+    puts("PASS shared-state allocation failure leaves no invalid pointer");
     test_port_protocol();
     test_worker_cases();
     return 0;
