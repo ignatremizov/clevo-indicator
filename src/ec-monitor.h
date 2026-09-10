@@ -5,6 +5,7 @@
 #include <sys/types.h>
 
 #define EC_SENSOR_MAX_AGE_MS 3000
+#define EC_COMMAND_RETRY_MS 2000
 
 typedef ssize_t (*EcReadAt)(int, void *, size_t, off_t);
 
@@ -23,10 +24,21 @@ typedef struct {
     int64_t updated_ms;
 } EcTemperature;
 
+typedef struct {
+    int target;
+    int attempted;
+    int confirmed;
+    int64_t attempted_ms;
+} EcFanCommand;
+
 int64_t ec_monotonic_ms(void);
 int ec_sample_read(int fd, EcReadAt read_at, EcSample *sample);
 void ec_temperature_update(EcTemperature *sensor, int value, int64_t now);
 int ec_temperature_value(const EcTemperature *sensor, int64_t now);
+/* Returns 1 when a write is due, 0 otherwise. Confirmation requires readback. */
+int ec_fan_command_due(EcFanCommand *command, int target, int actual,
+                       int64_t now);
+
 /*
  * A timed-out GPU query may be stuck in uninterruptible driver I/O. Retain its
  * PID and do not spawn replacements until it has exited; never block reaping.

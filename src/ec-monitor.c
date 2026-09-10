@@ -67,6 +67,29 @@ int ec_temperature_value(const EcTemperature *sensor, int64_t now)
     return sensor->value;
 }
 
+int ec_fan_command_due(EcFanCommand *command, int target, int actual,
+                       int64_t now)
+{
+    command->confirmed = 0;
+    if (target < 1 || target > 100)
+        return 0;
+    int changed = command->target != target;
+    command->target = target;
+    command->confirmed = actual >= 0 &&
+        abs(actual - target) <= (target == 100 ? 0 : 1);
+    if (command->confirmed)
+        return 0;
+    /* Emergency escalation bypasses the retry interval, but repeated failures
+       (including emergency writes) remain bounded to one attempt per 2 s. */
+    if (!command->attempted || (changed && target == 100) ||
+        now - command->attempted_ms >= EC_COMMAND_RETRY_MS) {
+        command->attempted = 1;
+        command->attempted_ms = now;
+        return 1;
+    }
+    return 0;
+}
+
 static int reap_query(EcGpuQuery *query, int *result)
 {
     pid_t ret = waitpid(query->child, result, WNOHANG);
