@@ -255,6 +255,7 @@ struct
 } static *share_info = NULL;
 
 static pid_t parent_pid = 0;
+static pid_t worker_pid = 0;
 
 void autoset_cpu_gpu()
 {
@@ -595,21 +596,31 @@ int main(int argc, char *argv[])
             main_init_share();
             signal(SIGCHLD, &main_on_sigchld);
             signal_term(&main_on_sigterm);
-            pid_t worker_pid = fork();
+            sigset_t child_mask, previous_mask;
+            sigemptyset(&child_mask);
+            sigaddset(&child_mask, SIGCHLD);
+            if (sigprocmask(SIG_BLOCK, &child_mask, &previous_mask) != 0)
+                return EXIT_FAILURE;
+            worker_pid = fork();
             if (worker_pid == 0)
             {
                 signal(SIGCHLD, SIG_DFL);
+                sigprocmask(SIG_SETMASK, &previous_mask, NULL);
                 signal_term(&ec_on_sigterm);
                 return main_ec_worker();
             }
             else if (worker_pid > 0)
             {
+                /* Publish worker_pid before an immediate child exit can run
+                   the handler; unrelated GPU child exits must not kill UI. */
+                sigprocmask(SIG_SETMASK, &previous_mask, NULL);
                 main_ui_worker(argc, argv);
                 share_info->exit = 1;
                 waitpid(worker_pid, NULL, 0);
             }
             else
             {
+                sigprocmask(SIG_SETMASK, &previous_mask, NULL);
                 printf("unable to create worker: %s\n", strerror(errno));
                 return EXIT_FAILURE;
             }
@@ -757,15 +768,17 @@ static void main_init_share(void)
     share_info->manual_prev_gpu_fan_duty = 0;
 }
 
-static volatile int g_gpu_temp_smi = -1;
+static EcTemperature g_gpu_temperature;
+static pthread_mutex_t g_gpu_temperature_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static void *gpu_temp_smi_thread(void *arg)
 {
     (void)arg;
     while (1) {
         int t = ec_query_gpu_temp_nvidia();
-        if (t > 0)
-            g_gpu_temp_smi = t;
+        pthread_mutex_lock(&g_gpu_temperature_lock);
+        ec_temperature_update(&g_gpu_temperature, t, ec_monotonic_ms());
+        pthread_mutex_unlock(&g_gpu_temperature_lock);
         sleep(1);
     }
     return NULL;
@@ -778,11 +791,13 @@ static int main_ec_worker(void)
 
     if (use_gpu_temp_smi) {
         pthread_t tid;
-        pthread_create(&tid, NULL, gpu_temp_smi_thread, NULL);
-        pthread_detach(tid);
+        if (pthread_create(&tid, NULL, gpu_temp_smi_thread, NULL) == 0)
+            pthread_detach(tid);
+        else
+            fprintf(stderr, "GPU temperature thread unavailable; using EC\n");
     }
 
-    int ec_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY);
+    int ec_fd = open("/sys/kernel/debug/ec/ec0/io", O_RDONLY | O_CLOEXEC);
     if (ec_fd < 0)
     {
         printf("unable to open EC sysfs: %s\n", strerror(errno));
@@ -824,7 +839,9 @@ static int main_ec_worker(void)
             share_info->cpu_temp = sample.cpu_temp;
             if (use_gpu_temp_smi)
             {
-                int smi_temp = g_gpu_temp_smi;
+                pthread_mutex_lock(&g_gpu_temperature_lock);
+                int smi_temp = ec_temperature_value(&g_gpu_temperature, ec_monotonic_ms());
+                pthread_mutex_unlock(&g_gpu_temperature_lock);
                 share_info->gpu_temp = smi_temp > 0 ? smi_temp : sample.gpu_temp;
             }
             else
@@ -1085,8 +1102,11 @@ static void main_ui_worker(int argc, char **argv)
 
 static void main_on_sigchld(int signum)
 {
-    printf("main on worker quit signal\n");
-    exit(EXIT_SUCCESS);
+    (void)signum;
+    /* A timed-out startup GPU query may exit after the worker is started.
+       Only losing the actual EC worker should terminate the UI. */
+    if (worker_pid > 0 && waitpid(worker_pid, NULL, WNOHANG) == worker_pid)
+        _exit(EXIT_SUCCESS);
 }
 
 static void main_on_sigterm(int signum)
@@ -1835,25 +1855,14 @@ static int ec_query_gpu_temp(void)
 
 static int ec_query_gpu_temp_nvidia(void)
 {
-    FILE *fp = popen("nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader,nounits", "r");
-    if (!fp)
-        return -1;
-
-    int temp = -1;
-    char line[128];
-    while (fgets(line, sizeof(line), fp) != NULL)
-    {
-        char *endptr = NULL;
-        errno = 0;
-        long parsed = strtol(line, &endptr, 10);
-        if (endptr != line && errno == 0 && parsed > 0 && parsed <= 300)
-        {
-            if (temp < 0 || parsed > temp)
-                temp = (int)parsed;
-        }
+    static EcGpuQuery query = {0};
+    static pid_t owner = 0;
+    if (owner != getpid()) {
+        /* A forked worker does not own its parent's outstanding child. */
+        query.child = 0;
+        owner = getpid();
     }
-    pclose(fp);
-    return temp;
+    return ec_gpu_query(&query, "/usr/bin/nvidia-smi", 1500);
 }
 
 static int ec_query_cpu_fan_duty(void)
