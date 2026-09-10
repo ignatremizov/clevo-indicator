@@ -156,7 +156,7 @@ static int ec_write_cpu_fan_duty(int duty_percentage);
 static int ec_write_gpu_fan_duty(int duty_percentage);
 static int ec_io_wait(const uint32_t port, const uint32_t flag,
                       const char value);
-static uint8_t ec_io_read(const uint32_t port);
+static int ec_io_read(const uint32_t port);
 static int ec_io_do(const uint32_t cmd, const uint32_t port,
                     const uint8_t value);
 static int calculate_fan_duty(int raw_duty);
@@ -1971,9 +1971,9 @@ static int ec_write_cpu_fan_duty(int duty_percentage)
         fp = fopen(name, "wb");
         if (fp == 0)
             return 99;
-        fprintf(fp, "%d\n", v_i);
-        fclose(fp);
-        return 0;
+        int written = fprintf(fp, "%d\n", v_i);
+        int closed = fclose(fp);
+        return written < 0 || closed != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     return ec_io_do(0x99, 0x01, v_i);
 }
@@ -1995,9 +1995,9 @@ static int ec_write_gpu_fan_duty(int duty_percentage)
         fp = fopen(name, "wb");
         if (fp == 0)
             return 99;
-        fprintf(fp, "%d\n", v_i);
-        fclose(fp);
-        return 0;
+        int written = fprintf(fp, "%d\n", v_i);
+        int closed = fclose(fp);
+        return written < 0 || closed != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
     }
     return ec_io_do(0x99, 0x02, v_i);
 }
@@ -2012,7 +2012,7 @@ static int ec_io_wait(const uint32_t port, const uint32_t flag,
         usleep(1000);
         data = inb(port);
     }
-    if (i >= 1000)
+    if (((data >> flag) & 0x1) != value)
     {
         printf("wait_ec error on port 0x%x, data=0x%x, flag=0x%x, value=0x%x\n",
                port, data, flag, value);
@@ -2021,16 +2021,19 @@ static int ec_io_wait(const uint32_t port, const uint32_t flag,
     return EXIT_SUCCESS;
 }
 
-static uint8_t ec_io_read(const uint32_t port)
+static int ec_io_read(const uint32_t port)
 {
-    ec_io_wait(EC_SC, IBF, 0);
+    if (ec_io_wait(EC_SC, IBF, 0) != EXIT_SUCCESS)
+        return -1;
     outb(EC_SC_READ_CMD, EC_SC);
 
-    ec_io_wait(EC_SC, IBF, 0);
+    if (ec_io_wait(EC_SC, IBF, 0) != EXIT_SUCCESS)
+        return -1;
     outb(port, EC_DATA);
 
     //wait_ec(EC_SC, EC_SC_IBF_FREE);
-    ec_io_wait(EC_SC, OBF, 1);
+    if (ec_io_wait(EC_SC, OBF, 1) != EXIT_SUCCESS)
+        return -1;
     uint8_t value = inb(EC_DATA);
 
     return value;
@@ -2039,13 +2042,16 @@ static uint8_t ec_io_read(const uint32_t port)
 static int ec_io_do(const uint32_t cmd, const uint32_t port,
                     const uint8_t value)
 {
-    ec_io_wait(EC_SC, IBF, 0);
+    if (ec_io_wait(EC_SC, IBF, 0) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
     outb(cmd, EC_SC);
 
-    ec_io_wait(EC_SC, IBF, 0);
+    if (ec_io_wait(EC_SC, IBF, 0) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
     outb(port, EC_DATA);
 
-    ec_io_wait(EC_SC, IBF, 0);
+    if (ec_io_wait(EC_SC, IBF, 0) != EXIT_SUCCESS)
+        return EXIT_FAILURE;
     outb(value, EC_DATA);
 
     return ec_io_wait(EC_SC, IBF, 0);
@@ -2053,11 +2059,15 @@ static int ec_io_do(const uint32_t cmd, const uint32_t port,
 
 static int calculate_fan_duty(int raw_duty)
 {
+    if (raw_duty < 0)
+        return -1;
     return (int)((double)raw_duty / 255.0 * 100.0 + 0.5);
 }
 
 static int calculate_fan_rpms(int raw_rpm_high, int raw_rpm_low)
 {
+    if (raw_rpm_high < 0 || raw_rpm_low < 0)
+        return -1;
     int raw_rpm = (raw_rpm_high << 8) + raw_rpm_low;
     return raw_rpm > 0 ? (2156220 / raw_rpm) : 0;
 }
