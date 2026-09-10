@@ -3,6 +3,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <glob.h>
+#include <limits.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
@@ -34,19 +36,112 @@ static int read_exact(int fd, EcReadAt read_at, void *buf, size_t len,
     return 0;
 }
 
-int ec_sample_read(int fd, EcReadAt read_at, EcSample *sample)
+int ec_sample_read(int fd, EcReadAt read_at, EcSample *sample, unsigned fields)
 {
-    EcSample next;
-    uint8_t block[7];
-    if (read_exact(fd, read_at, &next.cpu_temp, 1, 0x07) != 0 ||
-        read_exact(fd, read_at, block, sizeof(block), 0xCD) != 0)
+    EcSample next = *sample;
+    uint8_t duty[2];
+    if (fields & ~EC_READ_ALL)
         return -1;
-    next.gpu_temp = block[0];
-    next.cpu_duty = block[1];
-    next.gpu_duty = block[2];
-    memcpy(next.rpm, block + 3, sizeof(next.rpm));
+    if ((fields & EC_READ_CPU) &&
+        read_exact(fd, read_at, &next.cpu_temp, 1, EC_REG_CPU_TEMP) != 0)
+        return -1;
+    if ((fields & EC_READ_GPU) &&
+        read_exact(fd, read_at, &next.gpu_temp, 1, EC_REG_GPU_TEMP) != 0)
+        return -1;
+    if (fields & EC_READ_DUTY) {
+        if (read_exact(fd, read_at, duty, sizeof(duty), EC_REG_CPU_FAN_DUTY) != 0)
+            return -1;
+        next.cpu_duty = duty[0];
+        next.gpu_duty = duty[1];
+    }
+    if ((fields & EC_READ_RPM) &&
+        read_exact(fd, read_at, next.rpm, sizeof(next.rpm),
+                   EC_REG_CPU_FAN_RPMS_HI) != 0)
+        return -1;
     *sample = next; /* Never publish a partial sample. */
     return 0;
+}
+
+static int read_text(const char *path, char *buf, size_t size)
+{
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    ssize_t n;
+    do {
+        n = read(fd, buf, size - 1);
+    } while (n < 0 && errno == EINTR);
+    close(fd);
+    if (n <= 0 || (size_t)n >= size - 1)
+        return -1;
+    buf[n] = '\0';
+    return 0;
+}
+
+int ec_coretemp_read(const char *root)
+{
+    char pattern[PATH_MAX], path[PATH_MAX], text[128];
+    if (snprintf(pattern, sizeof(pattern), "%s/hwmon*/name", root) >=
+        (int)sizeof(pattern))
+        return -1;
+    glob_t devices = {0};
+    if (glob(pattern, 0, NULL, &devices) != 0) {
+        globfree(&devices);
+        return -1;
+    }
+    int hottest = -1, failed = 0;
+    for (size_t i = 0; i < devices.gl_pathc; i++) {
+        if (read_text(devices.gl_pathv[i], text, sizeof(text)) != 0 ||
+            (strcmp(text, "coretemp\n") && strcmp(text, "coretemp")))
+            continue;
+        size_t prefix = strlen(devices.gl_pathv[i]) - strlen("name");
+        if (snprintf(pattern, sizeof(pattern), "%.*stemp*_label",
+                     (int)prefix, devices.gl_pathv[i]) >= (int)sizeof(pattern)) {
+            failed = 1;
+            continue;
+        }
+        glob_t labels = {0};
+        if (glob(pattern, 0, NULL, &labels) != 0) {
+            failed = 1;
+            globfree(&labels);
+            continue;
+        }
+        int packages = 0;
+        for (size_t j = 0; j < labels.gl_pathc; j++) {
+            if (read_text(labels.gl_pathv[j], text, sizeof(text)) != 0) {
+                failed = 1;
+                continue;
+            }
+            unsigned id;
+            char extra;
+            if (sscanf(text, "Package id %u %c", &id, &extra) != 1)
+                continue;
+            packages++;
+            size_t base = strlen(labels.gl_pathv[j]) - strlen("label");
+            if (snprintf(path, sizeof(path), "%.*sinput", (int)base,
+                         labels.gl_pathv[j]) >= (int)sizeof(path) ||
+                read_text(path, text, sizeof(text)) != 0) {
+                failed = 1;
+                continue;
+            }
+            char *end;
+            errno = 0;
+            long milli = strtol(text, &end, 10);
+            if (errno || end == text || (*end && strcmp(end, "\n")) ||
+                milli < 15000 || milli > 125000) {
+                failed = 1;
+                continue;
+            }
+            int value = (int)((milli + 999) / 1000);
+            if (value > hottest)
+                hottest = value;
+        }
+        if (!packages)
+            failed = 1;
+        globfree(&labels);
+    }
+    globfree(&devices);
+    return failed ? -1 : hottest;
 }
 
 void ec_temperature_update(EcTemperature *sensor, int value, int64_t now)

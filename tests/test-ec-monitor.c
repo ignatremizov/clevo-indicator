@@ -5,9 +5,61 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 static int calls, bytes, short_reads, interrupt_read, fail_at;
+
+static void fixture_write(const char *root, const char *name, const char *text)
+{
+    char path[512];
+    assert(snprintf(path, sizeof(path), "%s/%s", root, name) < (int)sizeof(path));
+    FILE *fp = fopen(path, "w");
+    assert(fp);
+    assert(fputs(text, fp) >= 0);
+    assert(fclose(fp) == 0);
+}
+
+static void test_coretemp(void)
+{
+    char root[] = "/tmp/clevo-coretemp-test-XXXXXX", path[512];
+    assert(mkdtemp(root));
+    assert(ec_coretemp_read(root) == -1);
+    snprintf(path, sizeof(path), "%s/hwmon9", root);
+    assert(mkdir(path, 0700) == 0);
+    fixture_write(root, "hwmon9/name", "acpitz\n");
+    fixture_write(root, "hwmon9/temp3_label", "Package id 0\n");
+    fixture_write(root, "hwmon9/temp3_input", "46000\n");
+    assert(ec_coretemp_read(root) == -1);
+    fixture_write(root, "hwmon9/name", "coretemp\n");
+    assert(ec_coretemp_read(root) == 46);
+    fixture_write(root, "hwmon9/temp1_label", "Core 0\n");
+    fixture_write(root, "hwmon9/temp1_input", "99000\n");
+    assert(ec_coretemp_read(root) == 46); /* Never mistake a core for package. */
+    fixture_write(root, "hwmon9/temp4_label", "Package id 1\n");
+    fixture_write(root, "hwmon9/temp4_input", "61001\n");
+    assert(ec_coretemp_read(root) == 62); /* Hottest package, round upward. */
+    const char *bad[] = {"0\n", "126000\n", "60000junk\n", "",
+                         "9999999999999999999999999999999999999\n"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(*bad); i++) {
+        fixture_write(root, "hwmon9/temp4_input", bad[i]);
+        assert(ec_coretemp_read(root) == -1);
+    }
+    snprintf(path, sizeof(path), "%s/hwmon9/temp4_input", root);
+    assert(unlink(path) == 0);
+    assert(ec_coretemp_read(root) == -1);
+    const char *files[] = {"name", "temp1_label", "temp1_input",
+                          "temp3_label", "temp3_input", "temp4_label"};
+    for (size_t i = 0; i < sizeof(files) / sizeof(*files); i++) {
+        snprintf(path, sizeof(path), "%s/hwmon9/%s", root, files[i]);
+        assert(unlink(path) == 0);
+    }
+    snprintf(path, sizeof(path), "%s/hwmon9", root);
+    assert(rmdir(path) == 0);
+    assert(rmdir(root) == 0);
+    puts("PASS coretemp discovery, package selection, parsing, loss, and bounds");
+}
 
 static ssize_t fake_read(int fd, void *buf, size_t len, off_t offset)
 {
@@ -31,21 +83,26 @@ static ssize_t fake_read(int fd, void *buf, size_t len, off_t offset)
 
 static void test_reads(void)
 {
-    EcSample sample;
-    assert(ec_sample_read(42, fake_read, &sample) == 0);
-    assert(calls == 2 && bytes == 8);
+    EcSample sample = {0};
+    assert(ec_sample_read(42, fake_read, &sample, EC_READ_ALL) == 0);
+    assert(calls == 4 && bytes == 8);
     assert(sample.cpu_temp == 7 && sample.gpu_temp == 0xCD);
     assert(sample.cpu_duty == 0xCE && sample.gpu_duty == 0xCF);
     assert(sample.rpm[0] == 0xD0 && sample.rpm[3] == 0xD3);
     calls = bytes = 0;
     short_reads = interrupt_read = 1;
-    assert(ec_sample_read(42, fake_read, &sample) == 0);
+    assert(ec_sample_read(42, fake_read, &sample, EC_READ_ALL) == 0);
     assert(bytes == 8 && calls == 6);
     EcSample before = sample;
     calls = 0;
     fail_at = 3;
-    assert(ec_sample_read(42, fake_read, &sample) == -1);
+    assert(ec_sample_read(42, fake_read, &sample, EC_READ_ALL) == -1);
     assert(memcmp(&before, &sample, sizeof(sample)) == 0);
+    calls = bytes = fail_at = short_reads = 0;
+    assert(ec_sample_read(42, fake_read, &sample, EC_READ_DUTY) == 0);
+    assert(calls == 1 && bytes == 2);
+    assert(ec_sample_read(42, fake_read, &sample, 0) == 0);
+    assert(calls == 1 && bytes == 2);
     puts("PASS targeted reads, short reads, EINTR, partial-sample rejection");
 }
 
@@ -131,6 +188,7 @@ static void test_gpu(void)
 
 int main(void)
 {
+    test_coretemp();
     test_reads();
     test_temperatures();
     test_commands();

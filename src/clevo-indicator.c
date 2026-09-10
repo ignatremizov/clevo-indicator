@@ -76,19 +76,6 @@
  * 2. od -Ax -t x1 /sys/kernel/debug/ec/ec0/io
  */
 
-#define P775DM3 //THIS IS THE MODEL DEFINITION, TO FIND THE ADDRESSES IN THE EC
-
-#define EC_REG_SIZE 0x100
-
-#define EC_REG_CPU_FAN_DUTY 0xCE
-#define EC_REG_CPU_TEMP 0x07
-#define EC_REG_CPU_FAN_RPMS_HI 0xD0
-#define EC_REG_CPU_FAN_RPMS_LO 0xD1
-#define EC_REG_GPU_FAN_RPMS_HI 0xD2
-#define EC_REG_GPU_FAN_RPMS_LO 0xD3
-#define EC_REG_GPU_TEMP 0xCD
-#define EC_REG_GPU_FAN_DUTY 0xCF
-
 #define MAX_FAN_RPM 4400.0
 
 #define TEMP_FAIL_THRESHOLD 15
@@ -113,6 +100,7 @@ typedef enum
 int use_hwmon_interface = 0;
 int hwmon_interface_num = 0;
 static int use_gpu_temp_smi = 1;
+static int monitor_fan_rpm = 0;
 
 static void main_init_share(void);
 static int main_ec_worker(void);
@@ -512,6 +500,8 @@ void autoset_cpu_gpu()
 
 int main(int argc, char *argv[])
 {
+    monitor_fan_rpm = getenv("CLEVO_MONITOR_RPM") &&
+        strcmp(getenv("CLEVO_MONITOR_RPM"), "1") == 0;
     printf("Simple fan control utility for Clevo laptops\n");
     if (check_proc_instances(NAME) > 1)
     {
@@ -756,8 +746,8 @@ static void main_init_share(void)
     share_info->gpu_temp = 0;
     share_info->cpu_fan_duty = 0;
     share_info->gpu_fan_duty = 0;
-    share_info->cpu_fan_rpms = 0;
-    share_info->gpu_fan_rpms = 0;
+    share_info->cpu_fan_rpms = -1;
+    share_info->gpu_fan_rpms = -1;
     share_info->auto_cpu_duty = 0;
     share_info->auto_gpu_duty = 0;
     share_info->auto_cpu_duty_val = 0;
@@ -809,6 +799,9 @@ static int main_ec_worker(void)
     EcTemperature cpu_sensor = {0}, gpu_sensor = {0};
     EcFanCommand commands[2] = {0};
     int sensor_fault = 0;
+    int64_t next_temperature = 0, next_duty = 0, next_rpm = 0;
+    int duty_valid[2] = {0};
+    int64_t duty_updated = 0;
     while (share_info->exit == 0)
     {
         // check parent
@@ -817,28 +810,57 @@ static int main_ec_worker(void)
             printf("worker on parent death\n");
             break;
         }
-        EcSample sample;
-        int sample_ok = ec_sample_read(ec_fd, pread, &sample) == 0;
         int64_t now = ec_monotonic_ms();
-        if (sample_ok)
-        {
-            ec_temperature_update(&cpu_sensor, sample.cpu_temp, now);
-            ec_temperature_update(&gpu_sensor, sample.gpu_temp, now);
-            share_info->cpu_fan_duty = calculate_fan_duty(sample.cpu_duty);
-            share_info->gpu_fan_duty = calculate_fan_duty(sample.gpu_duty);
-            share_info->cpu_fan_rpms = calculate_fan_rpms(
-                sample.rpm[0], sample.rpm[1]);
-            share_info->gpu_fan_rpms = calculate_fan_rpms(
-                sample.rpm[2], sample.rpm[3]);
-            if (!initialized)
-            {
-                share_info->manual_prev_cpu_fan_duty = share_info->cpu_fan_duty;
-                share_info->manual_prev_gpu_fan_duty = share_info->gpu_fan_duty;
-                initialized = 1;
-            }
-        }
-        share_info->cpu_temp = ec_temperature_value(&cpu_sensor, now);
+        EcSample sample = {0};
+        int duty_read = 0;
         int gpu_temp = -1;
+        if (use_gpu_temp_smi) {
+            pthread_mutex_lock(&g_gpu_temperature_lock);
+            gpu_temp = ec_temperature_value(&g_gpu_temperature, now);
+            pthread_mutex_unlock(&g_gpu_temperature_lock);
+        }
+        if (now >= next_temperature) {
+            int cpu_temp = ec_coretemp_read("/sys/class/hwmon");
+            if (cpu_temp >= 0)
+                ec_temperature_update(&cpu_sensor, cpu_temp, now);
+            else if (ec_sample_read(ec_fd, pread, &sample, EC_READ_CPU) == 0)
+                ec_temperature_update(&cpu_sensor, sample.cpu_temp, now);
+            /* Do not carry an old EC value across a healthy native interval. */
+            if (gpu_temp >= 0)
+                gpu_sensor.valid = 0;
+            else if (ec_sample_read(ec_fd, pread, &sample, EC_READ_GPU) == 0)
+                ec_temperature_update(&gpu_sensor, sample.gpu_temp, now);
+            next_temperature = ec_monotonic_ms() + EC_POLL_MS;
+        }
+        if (now >= next_duty) {
+            duty_read = 1;
+            int ok = ec_sample_read(ec_fd, pread, &sample, EC_READ_DUTY) == 0;
+            duty_valid[0] = duty_valid[1] = ok;
+            if (ok) {
+                share_info->cpu_fan_duty = calculate_fan_duty(sample.cpu_duty);
+                share_info->gpu_fan_duty = calculate_fan_duty(sample.gpu_duty);
+                duty_updated = ec_monotonic_ms();
+                if (!initialized) {
+                    share_info->manual_prev_cpu_fan_duty = share_info->cpu_fan_duty;
+                    share_info->manual_prev_gpu_fan_duty = share_info->gpu_fan_duty;
+                    initialized = 1;
+                }
+            } else {
+                share_info->cpu_fan_duty = share_info->gpu_fan_duty = -1;
+            }
+            next_duty = ec_monotonic_ms() + EC_DUTY_VERIFY_MS;
+        }
+        if (monitor_fan_rpm && now >= next_rpm) {
+            int ok = ec_sample_read(ec_fd, pread, &sample, EC_READ_RPM) == 0;
+            share_info->cpu_fan_rpms = ok ?
+                calculate_fan_rpms(sample.rpm[0], sample.rpm[1]) : -1;
+            share_info->gpu_fan_rpms = ok ?
+                calculate_fan_rpms(sample.rpm[2], sample.rpm[3]) : -1;
+            next_rpm = ec_monotonic_ms() + EC_POLL_MS;
+        }
+        now = ec_monotonic_ms();
+        share_info->cpu_temp = ec_temperature_value(&cpu_sensor, now);
+        /* EC operations may have waited in the kernel since the first check. */
         if (use_gpu_temp_smi) {
             pthread_mutex_lock(&g_gpu_temperature_lock);
             gpu_temp = ec_temperature_value(&g_gpu_temperature, now);
@@ -872,6 +894,8 @@ static int main_ec_worker(void)
         int target_temp = fault ? AUTO_FAN_EMERGENCY_TEMP_C :
             MAX(share_info->cpu_temp, share_info->gpu_temp);
         for (int index = 0; index < 2; index++) {
+            int sample_ok = duty_valid[index] && now >= duty_updated &&
+                now - duty_updated < EC_DUTY_VERIFY_MS + EC_POLL_MS;
             FanIndex fan = index == 0 ? FAN_CPU : FAN_GPU;
             int automatic = index == 0 ? share_info->auto_cpu_duty :
                                         share_info->auto_gpu_duty;
@@ -893,6 +917,10 @@ static int main_ec_worker(void)
             if (ec_fan_command_due(&commands[index], requested, actual, now)) {
                 int result = index == 0 ? ec_write_cpu_fan_duty(requested) :
                                           ec_write_gpu_fan_duty(requested);
+                /* A pre-write sample cannot acknowledge this attempt, even
+                   when the port call failed after partially issuing it. */
+                duty_valid[index] = 0;
+                next_duty = 0; /* Read back on the next control tick. */
                 if (result != EXIT_SUCCESS)
                     fprintf(stderr, "%s fan write failed; retrying after 2 s\n",
                             index == 0 ? "CPU" : "GPU");
@@ -916,6 +944,15 @@ static int main_ec_worker(void)
                         share_info->manual_prev_gpu_fan_duty = actual;
                 }
             }
+        }
+        if (duty_read && next_duty != 0) {
+            /* Decide after confirmation, avoiding an extra one-second read
+               after a command has already been acknowledged this tick. */
+            int pending = !duty_valid[0] || !duty_valid[1];
+            for (int i = 0; i < 2; i++)
+                pending |= commands[i].target > 0 && !commands[i].confirmed;
+            next_duty = ec_monotonic_ms() +
+                (pending ? EC_POLL_MS : EC_DUTY_VERIFY_MS);
         }
         //
         usleep(200 * 1000);

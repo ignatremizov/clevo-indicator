@@ -24,6 +24,7 @@ static int test_usleep(useconds_t delay);
 static unsigned char test_inb(unsigned short port);
 static void test_outb(unsigned char value, unsigned short port);
 static int64_t test_now(void);
+static int test_coretemp(const char *root);
 
 #define main unused_indicator_main
 #define setuid test_setuid
@@ -35,6 +36,7 @@ static int64_t test_now(void);
 #define inb test_inb
 #define outb test_outb
 #define ec_monotonic_ms test_now
+#define ec_coretemp_read test_coretemp
 #include "../src/clevo-indicator.c"
 #undef main
 #undef setuid
@@ -46,6 +48,7 @@ static int64_t test_now(void);
 #undef inb
 #undef outb
 #undef ec_monotonic_ms
+#undef ec_coretemp_read
 
 static __typeof__(*share_info) shared;
 static int loops, limit, fail_sample_after, bytes_read, write_count;
@@ -53,6 +56,8 @@ static int busy_after_writes, status_byte, readback, port_sleeps;
 static int gpu_cache_test, change_to_manual, recover_after;
 static unsigned char cpu_temperature, gpu_temperature, cpu_duty, gpu_duty;
 static unsigned char written[512];
+static int native_cpu, native_gpu, rpm_bytes, duty_bytes, duty_drift, fail_rpm;
+static int lose_native_cpu;
 
 static void reset_worker(int iterations)
 {
@@ -63,6 +68,12 @@ static void reset_worker(int iterations)
     parent_pid = 0;
     use_gpu_temp_smi = 0;
     use_hwmon_interface = 0;
+    monitor_fan_rpm = 0;
+    native_cpu = native_gpu = -1;
+    rpm_bytes = duty_bytes = 0;
+    duty_drift = fail_rpm = 0;
+    lose_native_cpu = 0;
+    shared.cpu_fan_rpms = shared.gpu_fan_rpms = -1;
     loops = bytes_read = write_count = port_sleeps = 0;
     limit = iterations;
     fail_sample_after = busy_after_writes = -1;
@@ -71,6 +82,16 @@ static void reset_worker(int iterations)
     cpu_temperature = 60;
     gpu_temperature = 55;
     cpu_duty = gpu_duty = 128;
+}
+
+static int test_coretemp(const char *root)
+{
+    assert(strcmp(root, "/sys/class/hwmon") == 0);
+    if (native_gpu >= 0) {
+        use_gpu_temp_smi = 1;
+        ec_temperature_update(&g_gpu_temperature, native_gpu, test_now());
+    }
+    return lose_native_cpu && loops >= 5 ? -1 : native_cpu;
 }
 
 static int test_setuid(uid_t uid)
@@ -115,12 +136,21 @@ static ssize_t test_pread(int fd, void *buf, size_t len, off_t offset)
     if (offset == 0x07) {
         assert(len == 1);
         *(unsigned char *)buf = cpu_temperature;
+    } else if (offset == 0xCD) {
+        assert(len == 1);
+        *(unsigned char *)buf = gpu_temperature;
+    } else if (offset == 0xCE) {
+        assert(len == 2);
+        ((unsigned char *)buf)[0] = cpu_duty;
+        ((unsigned char *)buf)[1] = gpu_duty;
+        duty_bytes += len;
     } else {
-        assert(offset == 0xCD && len == 7);
-        unsigned char block[7] = {
-            gpu_temperature, cpu_duty, gpu_duty, 0x02, 0x10, 0x02, 0x20
-        };
-        memcpy(buf, block, sizeof(block));
+        assert(offset == 0xD0 && len == 4);
+        if (fail_rpm)
+            return -1;
+        unsigned char rpm[4] = {0x02, 0x10, 0x02, 0x20};
+        memcpy(buf, rpm, sizeof(rpm));
+        rpm_bytes += len;
     }
     bytes_read += len;
     return len;
@@ -138,6 +168,8 @@ static int test_usleep(useconds_t delay)
         return 0;
     }
     assert(delay == 200000);
+    if (duty_drift && loops == 10)
+        cpu_duty = 100;
     if (readback && write_count >= 3) {
         assert(written[write_count - 3] == 0x99);
         if (written[write_count - 2] == 1)
@@ -203,8 +235,66 @@ static void test_worker_cases(void)
 {
     reset_worker(5);
     assert(main_ec_worker() == 0);
-    assert(bytes_read == 5 * 8 && write_count == 0);
-    puts("PASS worker reads eight bytes per cycle and preserves manual fans");
+    assert(bytes_read == 4 && write_count == 0 && rpm_bytes == 0);
+    puts("PASS worker decouples EC reads from control ticks and preserves manual fans");
+
+    reset_worker(151);
+    native_cpu = 60;
+    native_gpu = 55;
+    assert(main_ec_worker() == 0);
+    assert(duty_bytes == 4 && rpm_bytes == 0 && bytes_read == 5);
+    assert(shared.cpu_fan_rpms == -1 && shared.gpu_fan_rpms == -1);
+    puts("PASS native temperatures leave only 30-second duty verification after startup");
+
+    reset_worker(6);
+    monitor_fan_rpm = 1;
+    assert(main_ec_worker() == 0);
+    assert(rpm_bytes == 8);
+    puts("PASS explicit RPM opt-in samples counters once per second");
+
+    reset_worker(6);
+    monitor_fan_rpm = fail_rpm = 1;
+    assert(main_ec_worker() == 0);
+    assert(shared.cpu_temp == 60 && shared.gpu_temp == 55);
+    assert(shared.cpu_fan_rpms == -1 && write_count == 0);
+    puts("PASS optional RPM failures do not invalidate control temperatures");
+
+    reset_worker(153);
+    native_cpu = 60;
+    native_gpu = 55;
+    shared.manual_next_cpu_fan_duty = 50;
+    duty_drift = 1;
+    readback = 1;
+    assert(main_ec_worker() == 0);
+    assert(write_count == 3 && shared.manual_prev_cpu_fan_duty == 50);
+    puts("PASS background readback detects and corrects manual duty drift");
+
+    reset_worker(6);
+    native_cpu = 70;
+    lose_native_cpu = 1;
+    assert(main_ec_worker() == 0);
+    assert(shared.cpu_temp == 60);
+    puts("PASS loss of native CPU source falls back to EC on next sample");
+
+    reset_worker(20);
+    native_cpu = 60;
+    native_gpu = 55;
+    fail_sample_after = 0;
+    shared.auto_cpu_duty = 1;
+    assert(main_ec_worker() == 0);
+    assert(shared.cpu_temp == 60 && shared.gpu_temp == 55);
+    assert(write_count == 0);
+    puts("PASS EC failure leaves native temperatures valid and holds ordinary AUTO changes");
+
+    reset_worker(20);
+    native_cpu = 95;
+    native_gpu = 55;
+    fail_sample_after = 0;
+    shared.auto_cpu_duty = 1;
+    assert(main_ec_worker() == 0);
+    assert(write_count == 6 && written[2] == 255 && written[5] == 255);
+    assert(shared.auto_cpu_duty_val == 0);
+    puts("PASS native CPU emergency bypasses missing duty feedback without false confirmation");
 
     reset_worker(15);
     shared.manual_next_cpu_fan_duty = 70;

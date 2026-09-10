@@ -38,7 +38,11 @@ They communicate through one shared anonymous `mmap` page (`share_info`), which 
 
 ### EC Sampling And Command Confirmation
 
-`src/ec-monitor.c` provides the positional EC sampler, temperature freshness helpers, bounded GPU subprocess query, and per-fan retry/readback tracking. The worker samples `0x07` and `0xCD–0xD3`, publishing the eight relevant bytes only after both reads complete. The 200 ms post-cycle sleep remains unchanged. The full-register dump is reserved for the explicit `dumpall` command.
+`src/ec-monitor.c` provides selective positional EC reads, coretemp package discovery, temperature freshness helpers, bounded GPU subprocess queries, and per-fan retry/readback tracking. Named model-specific registers live in `src/ec-monitor.h`, shared with the CLI. Each requested group (CPU temperature, GPU temperature, both duties, or both RPM counters) is published atomically; unrelated groups fail independently. The full-register dump is reserved for the explicit `dumpall` command.
+
+The 200 ms control tick is separate from hardware polling. CPU temperature uses the hottest coretemp package once per second, with EC fallback; EC GPU temperature is read at that cadence only when NVIDIA data is unavailable. Duty readback occurs at startup, every 30 seconds while stable, and on the tick after a write attempt. Failed/unconfirmed readback uses a one-second interval. An attempt invalidates that fan's pre-write duty; successful samples can be reused until the next routine verification, with an age limit of 31 seconds. Stable native-temperature operation reads only two EC bytes per 30 seconds. Firmware/external changes can therefore remain undetected until that verification.
+
+Background RPM polling is disabled unless `CLEVO_MONITOR_RPM=1`; enabled polling reads four bytes once per second. Disabled or failed RPM values are `-1`. Explicit CLI diagnostics still read RPM on demand. Coretemp discovery uses the fixed `/sys/class/hwmon` root, device names and package labels, never a user-supplied privileged filesystem path.
 
 CPU/EC GPU readings expire after three seconds without a successful sample. The NVIDIA thread publishes a mutex-protected value and monotonic timestamp; failed queries invalidate that cache, and stale data falls back to the EC. Unavailable sensors are represented as `-1`. Sensor loss requests 100% only for AUTO-selected fans; recovery resets smoothing state and resumes the existing curve. Manual selections remain in force.
 
@@ -412,23 +416,22 @@ That later became the legacy fallback architecture described earlier in this doc
 
 - loading `ec_sys`
 - opening `/sys/kernel/debug/ec/ec0/io`
-- reading the 256-byte EC register space
+- sampling native temperatures and selectively reading EC fallback/feedback registers
 - applying pending manual CPU and GPU fan duty changes
 - running the auto-duty adjustment logic
 - updating the shared `share_info` page
 
-The loop runs every 200 ms.
+The loop sleeps 200 ms after each tick; hardware polling follows the independent schedules described above.
 
 ### EC sysfs I/O
 
 The worker uses low-level file-descriptor I/O:
 
 - `open()`
-- `lseek(fd, 0, SEEK_SET)`
-- `read()`
+- `pread()` for selected register groups
 - `close()`
 
-This replaced `fopen()`/`fread()`/`rewind()`/`fclose()`. The explicit file-descriptor path avoids stdio buffering interactions when re-reading the same EC sysfs node every cycle.
+The explicit positional file-descriptor path avoids stdio buffering interactions and full EC dumps in the background worker.
 
 ### GPU temperature sampling
 
@@ -437,15 +440,15 @@ When `use_gpu_temp_smi` is enabled, the worker starts a detached `pthread` runni
 That thread:
 
 - calls `ec_query_gpu_temp_nvidia()`
-- stores the latest successful result in `g_gpu_temp_smi`
+- updates the mutex-protected, timestamped `g_gpu_temperature` cache and invalidates it on failure
 - sleeps for one second between samples
 
 The EC loop then chooses GPU temperature as:
 
-- latest SMI sample if one is available
-- otherwise the EC register value
+- latest valid, unexpired SMI sample if one is available
+- otherwise a fresh EC fallback reading
 
-This decouples Nvidia SMI polling from the 200 ms EC hot loop and gives the SMI path a steady 1 Hz sampling rate.
+This decouples NVIDIA queries from control ticks. The thread waits one second after each bounded query; query time adds latency, so it is not a fixed 1 Hz sampling deadline.
 
 ### Auto mode
 
@@ -467,7 +470,7 @@ The steady-state flow is:
 2. User activates a CPU or GPU preset from the popup window or, in legacy mode, from an AppIndicator menu.
 3. UI writes the requested mode or duty into `share_info`.
 4. EC worker sees the pending change on the next cycle and writes it to the controller.
-5. EC worker refreshes temperatures, fan duty, and RPM values from hardware.
+5. The worker refreshes temperatures and fan duties on independent schedules, plus RPM only when explicitly enabled.
 6. UI reflects the new state on the next timer tick.
 
 ## Build impact

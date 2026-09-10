@@ -28,7 +28,9 @@ Build on top of:
 
 ## Hardware Compatibility
 
-This fork targets the Clevo X170KM-G / Xotic XMG170KM used for development. Its EC GPU temperature register is **`0xCD`**, not `0x0A`. Both the indicator's compact EC sample and the CLI register definition use `0xCD`. The indicator prefers a valid, fresh NVIDIA temperature reading and falls back to the EC GPU temperature when that reading is unavailable.
+This fork is developed on an XoticPC-supplied laptop whose DMI reports board **`X170KM-G`**, vendor `SchenkerTechnologiesGmbH`, and product `XMG ULTRA 17 (Early 2021)`. Reseller branding and firmware-reported names can differ. The EC GPU temperature address used on this machine is **`0xCD`**, not `0x0A`. The indicator and CLI share the named register definitions in [src/ec-monitor.h](src/ec-monitor.h). The indicator prefers a valid, fresh NVIDIA temperature reading and falls back to the EC GPU temperature when that reading is unavailable.
+
+Older source carried an unused `#define P775DM3` before these addresses. It did not select a register map or detect the laptop model; its provenance is now retained in the shared header's comment rather than a misleading model-selection macro. The inherited layout has been used on the development machine, but this is not an independently reverse-engineered register specification for every X170KM-G or firmware revision.
 
 Register mappings differ between models and forks: for example, [gateslu's `v1.0` implementation](https://github.com/gateslu/clevo-indicator/blob/91ec5041eebdd97b2507c8f9c99ef631b68d947d/src/clevo-indicator.cpp#L24) uses **`0x0A`**. Neither address is a universal Clevo mapping. Verify the target model's temperature registers and fan-control protocol before using this fork on another laptop or importing hardware-specific changes; these mappings are currently hardcoded, not automatically detected.
 
@@ -103,16 +105,36 @@ These tests do not require root, access the EC/NVIDIA hardware, initialize GTK, 
 
 ## Indicator Polling And Fault Handling
 
-- The worker reads eight EC registers using two positional reads: CPU temperature at `0x07`, then GPU temperature, duties, and RPM counters at `0xCD–0xD3`. The full 256-byte dump remains available only through `dumpall`.
-- The existing 200 ms sleep after each cycle and normal automatic fan curve are unchanged. Reads and writes add their own latency; this is not a fixed 5 Hz deadline. Eight instead of 256 bytes means 96.9% fewer register reads **per sample**.
-- Live before/after validation on the development machine measured `irq/9-acpi` CPU usage falling from about 10% to 0.6–0.8% of one core, worker CPU from about 2.33% to 0.2–0.4%, and EC interrupts from about 1,491 to 80 per second. Power draw also decreased, but the attributable power savings and battery-life improvement were not measured under controlled conditions. These are observations on this machine, not guaranteed results for other hardware or workloads.
-- A partial/failed EC sample is not published. Previously valid temperatures expire after three seconds. Values outside 15–125°C are treated as invalid; unavailable temperatures are exposed as `-1`, including in the panel label.
+- CPU temperature is sampled once per second through Linux's `coretemp` hwmon driver, discovered by device name and `Package id` labels rather than a fixed `hwmonN`. The hottest valid package is used. If that source is unavailable or invalid, the worker reads the EC CPU temperature register instead. GPU EC temperature is likewise read only when the NVIDIA source is unavailable. No new driver or subprocess is needed for coretemp.
+- Fan duties are read at startup and every 30 seconds while stable, with readback on the next control tick after every write attempt. Failed or unconfirmed readbacks are checked once per second. Pre-write duty data is invalidated for the affected fan; cached verified duties remain usable between routine checks. This deliberately allows up to roughly 30 seconds to detect unsolicited firmware/external duty changes.
+- Background RPM reads are disabled by default. Set `CLEVO_MONITOR_RPM=1` when launching the indicator to sample both RPM counters once per second for diagnostics; disabled or failed RPM telemetry is `-1`. Explicit CLI diagnostics retain their on-demand reads, including RPM in `dump` and the full 256-byte register space in `dumpall`.
+- With healthy native temperature sources, RPM disabled, and stable fan settings, routine EC traffic is only the two duty bytes every 30 seconds. Temperature fallbacks, command verification, and optional RPM telemetry add reads only as needed. The 200 ms control-loop sleep and normal curve/hysteresis logic remain unchanged, but the new CPU source and one-second temperature cadence can change when curve thresholds are crossed. Reads and writes add latency; these intervals are not hard real-time deadlines.
+- Each requested EC field group is published only after a complete read; temperature, duty, and optional RPM failures are handled independently. Previously valid temperatures expire after three seconds. Values outside 15–125°C are treated as invalid; unavailable temperatures are exposed as `-1`, including in the panel label.
 - NVIDIA queries use `/usr/bin/nvidia-smi` without a shell, have a 1.5-second deadline, and invalidate their cached temperature on failure. Expired or invalid NVIDIA data falls back to fresh EC GPU data. The query thread waits one second between attempts. If a killed query remains stuck in the driver, the thread does not spawn a replacement until that child exits.
 - If either temperature is unavailable, fans explicitly selected as **AUTO** request 100% until valid readings return. Manual fan settings are not overridden. Fault/recovery messages are logged on transitions. This is a conservative sensor-failure policy, not a change to the normal fan curve.
 - Failed readback holds ordinary automatic adjustments; emergency requests remain possible. A fan command is confirmed only by a fresh duty readback, with one percentage point of tolerance for ordinary targets and exact 100% for emergency targets. Unconfirmed requests are retried at most once every two seconds per fan; a new 100% escalation can bypass that delay.
 - Port-protocol timeouts stop the command rather than sending subsequent bytes after a failed wait. Repeated attempts are rate-limited, not abandoned after a finite retry count, because the requested cooling may still be needed.
 
 The kernel's [`ec_sys` read implementation](https://github.com/torvalds/linux/blob/master/drivers/acpi/ec_sys.c) performs an EC transaction for each requested byte. This is why reducing the register range matters even though the old code used a single `read()` call.
+
+### Measured EC Reduction
+
+The first optimization replaced a full 256-byte EC dump on every control cycle with eight targeted bytes. Live validation on the development machine reduced ACPI IRQ CPU from about 10% to 0.6–0.8% of one core and EC interrupts from approximately 1,491 to 80 per second.
+
+Native temperature sources and sparse feedback now reduce stable background reads further: from eight bytes per roughly 200 ms cycle to **two duty bytes every 30 seconds**. At the nominal cadence, that is about **600 times fewer EC bytes** than the eight-byte implementation, excluding startup, temperature fallbacks, fan commands, and optional RPM polling. Actual cycles include hardware latency.
+
+Two 60-second before/after windows on the development machine measured the following additional reduction. Both fans remained in AUTO at 42%, with CPU temperatures around 45–47°C and GPU temperature at 44°C; compilation was outside the measurement windows.
+
+| Measurement | Eight-byte polling | Native temperatures + sparse feedback |
+| --- | --- | --- |
+| `irq/9-acpi` CPU, percent of one core | 0.600% | 0.000% at CPU tick resolution |
+| Worker CPU, percent of one core | 0.283% | 0.183% |
+| Indicator UI CPU, percent of one core | 1.583% | 0.883% |
+| EC interrupts per second (`gpe6E`) | 77.856 | 0.133 |
+| RAPL CPU package power | 8.269 W | 8.248 W |
+| RAPL platform (`psys`) estimate | 75.456 W | 75.206 W |
+
+The measured EC interrupt reduction is approximately **99.8%** relative to eight-byte polling. The roughly 0.25 W platform-power difference is small and inconclusive under a changing desktop workload, not a quantified battery-life gain. RAPL is not a wall-socket measurement, its domains overlap, and process CPU figures exclude short-lived NVIDIA query children. These are observations on one machine, not guarantees for other devices or workloads; a zero IRQ CPU sample means below tick resolution, not zero work.
 
 ### Validation Before Deployment
 
